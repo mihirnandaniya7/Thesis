@@ -1,0 +1,17 @@
+[project]
+name = "surrogate-thesis"
+version = "0.1.0"
+description = "Synthetic microgrid load simulation and surrogate modeling thesis scaffold."
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  "matplotlib",
+  "torch",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

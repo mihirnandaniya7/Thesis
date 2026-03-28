@@ -66,18 +66,31 @@ def plot_runtime_comparison(metrics_frame: pd.DataFrame, output_path: str | Path
 
     frame = metrics_frame.copy()
     plt.figure(figsize=(10, 5))
-    plt.bar(frame["model_name"], frame["latency_ms"], color="#2a9d8f", label="model")
-    if "simulator_latency_ms" in frame:
+    metric_column = (
+        "full_test_runtime_ms" if "full_test_runtime_ms" in frame.columns else "latency_ms"
+    )
+    simulator_column = (
+        "simulator_full_test_runtime_ms"
+        if "simulator_full_test_runtime_ms" in frame.columns
+        else "simulator_latency_ms"
+    )
+    plt.bar(frame["model_name"], frame[metric_column], color="#2a9d8f", label="model")
+    if simulator_column in frame:
         plt.plot(
             frame["model_name"],
-            frame["simulator_latency_ms"],
+            frame[simulator_column],
             color="#e76f51",
             marker="o",
             linewidth=2,
             label="reference_simulator",
         )
-    plt.ylabel("Latency (ms)")
-    plt.title("Average Inference Latency vs. Simulator Step Runtime")
+    ylabel = "Runtime (ms)"
+    title = "Model Runtime vs. Reference Simulator Runtime"
+    if metric_column == "latency_ms":
+        ylabel = "Latency (ms)"
+        title = "Average Inference Latency vs. Simulator Step Runtime"
+    plt.ylabel(ylabel)
+    plt.title(title)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output, dpi=160)
@@ -112,4 +125,3 @@ def plot_error_by_hour(
     plt.tight_layout()
     plt.savefig(output, dpi=160)
     plt.close()
-

@@ -12,10 +12,10 @@ The reference system is a synthetic, high-fidelity microgrid load simulator that
 
 - Forecast type: short-term load forecasting
 - Time resolution: 15 minutes
-- Lookback window: 16 past steps
+- Lookback window: 32 past steps
 - Prediction horizon: 1 future step
-- Input features: past load values together with hour-of-day sine/cosine features and a weekday/weekend flag
-- Target variable: next-step load in Stage 1, with a clear extension path to net load in Stage 2
+- Input features: load, PV generation, battery state-of-charge, net load, hour-of-day sine/cosine features, and a weekday/weekend flag
+- Target variable: next-step net load
 
 ## Research Contribution
 
@@ -47,5 +47,4 @@ The surrogate models are evaluated on two axes:
 
 ## Scope Boundary
 
-Stage 1 keeps the simulator centered on synthetic load generation so that the complete surrogate pipeline can be built and defended cleanly. Stage 2 extends the same simulator with PV, battery, and hybrid switching logic after the baseline pipeline is already working.
-
+The current implementation uses a richer Stage 2 simulator by default so that the surrogate is evaluated on a more meaningful microgrid forecasting task. Hybrid switching remains a later decision layer after surrogate quality is measured.

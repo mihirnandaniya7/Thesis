@@ -1,6 +1,6 @@
 # Surrogate Thesis Scaffold
 
-This repository implements a thesis-safe baseline for surrogate modeling based short-term load forecasting in microgrids.
+This repository implements a staged surrogate-modeling thesis scaffold for short-term forecasting in microgrids.
 
 The project follows the intended thesis order:
 
@@ -10,7 +10,7 @@ The project follows the intended thesis order:
 4. Train baselines.
 5. Train the Transformer surrogate.
 6. Evaluate accuracy and runtime.
-7. Keep Stage 2 microgrid realism optional until the baseline is stable.
+7. Extend to richer microgrid behavior and hybrid switching.
 
 ## Structure
 
@@ -62,7 +62,19 @@ Each experiment writes:
 - `lstm`: sequence baseline
 - `transformer`: main surrogate model
 
-## Stage 2 Upgrade Path
+## Current Default Task
 
-The simulator already supports an optional richer microgrid mode with PV and battery state-of-charge. It is disabled by default so the baseline thesis pipeline stays focused and defensible.
+- Stage 2 microgrid mode is enabled in the default experiment
+- target: `net_load_kw`
+- features: `load_kw`, `pv_kw`, `battery_soc_kwh`, `net_load_kw`, `hour_sin`, `hour_cos`, `is_weekend`
+- lookback: `32`
+- horizon: `1`
 
+## Runtime Evaluation
+
+The evaluation now reports:
+
+- single-sample latency
+- batched per-sample latency
+- full test-set runtime
+- speedup against the reference simulator using the full test set

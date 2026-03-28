@@ -23,13 +23,21 @@ class SmokePipelineTests(unittest.TestCase):
             simulator=SimulatorConfig(
                 days=10,
                 internal_substeps=4,
-                include_stage2_microgrid=False,
+                include_stage2_microgrid=True,
             ),
             dataset=DatasetConfig(
-                lookback=16,
+                lookback=32,
                 horizon=1,
-                feature_columns=["load_kw", "hour_sin", "hour_cos", "is_weekend"],
-                target_column="load_kw",
+                feature_columns=[
+                    "load_kw",
+                    "pv_kw",
+                    "battery_soc_kwh",
+                    "net_load_kw",
+                    "hour_sin",
+                    "hour_cos",
+                    "is_weekend",
+                ],
+                target_column="net_load_kw",
             ),
             model=ModelConfig(
                 lstm_hidden_size=16,
@@ -63,6 +71,9 @@ class SmokePipelineTests(unittest.TestCase):
             self.assertTrue((Path(temp_dir) / "run" / "summary.json").exists())
             self.assertTrue((Path(temp_dir) / "run" / "metrics.csv").exists())
             self.assertTrue((Path(temp_dir) / "run" / "plots" / "prediction_overview.png").exists())
+            metrics_text = (Path(temp_dir) / "run" / "metrics.csv").read_text()
+            self.assertIn("single_sample_latency_ms", metrics_text)
+            self.assertIn("full_test_runtime_ms", metrics_text)
 
 
 if __name__ == "__main__":

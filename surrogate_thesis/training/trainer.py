@@ -46,7 +46,10 @@ def fit_model(
 
     if model_name == "persistence":
         target_index = config.dataset.feature_columns.index(config.dataset.target_column)
-        model = PersistenceBaseline(target_feature_index=target_index).fit(train_split.X, train_split.y)
+        model = PersistenceBaseline(
+            target_feature_index=target_index,
+            horizon=horizon,
+        ).fit(train_split.X, train_split.y)
         checkpoint = output_path / f"{model_name}.pkl"
         checkpoint.write_bytes(pickle.dumps(model))
         return ModelArtifacts(name=model_name, model=model, checkpoint_path=checkpoint)
@@ -225,4 +228,3 @@ def _train_torch_model(
     model.load_state_dict(best_state)
     torch.save(best_state, checkpoint_path)
     return history, perf_counter() - start
-

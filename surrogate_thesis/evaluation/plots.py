@@ -125,3 +125,84 @@ def plot_error_by_hour(
     plt.tight_layout()
     plt.savefig(output, dpi=160)
     plt.close()
+
+
+def plot_decorator_threshold_sensitivity(
+    sensitivity_frame: pd.DataFrame,
+    output_path: str | Path,
+    model_name: str,
+) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    frame = sensitivity_frame.sort_values(by="threshold_multiplier")
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    axes[0].plot(
+        frame["threshold_multiplier"],
+        frame["decorator_mae"],
+        marker="o",
+        label="decorator_mae",
+        color="#1d3557",
+    )
+    axes[0].plot(
+        frame["threshold_multiplier"],
+        frame["pure_surrogate_mae"],
+        marker="s",
+        linestyle="--",
+        label="pure_surrogate_mae",
+        color="#e63946",
+    )
+    axes[0].set_ylabel("MAE (kW)")
+    axes[0].set_title(f"Decorator Threshold Sensitivity: {model_name}")
+    axes[0].legend()
+
+    axes[1].plot(
+        frame["threshold_multiplier"],
+        frame["surrogate_usage_ratio"],
+        marker="o",
+        label="surrogate_usage_ratio",
+        color="#2a9d8f",
+    )
+    axes[1].plot(
+        frame["threshold_multiplier"],
+        frame["decorator_speedup"],
+        marker="s",
+        label="decorator_speedup",
+        color="#f4a261",
+    )
+    axes[1].set_xlabel("Threshold Multiplier")
+    axes[1].set_ylabel("Usage Ratio / Speedup")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+
+
+def plot_decorator_decision_trace(
+    trace_frame: pd.DataFrame,
+    output_path: str | Path,
+    model_name: str,
+) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    frame = trace_frame.copy()
+    frame["mode_flag"] = frame["mode"].map({"simulation": 0, "surrogate": 1})
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    axes[0].plot(frame["index"], frame["rolling_error_after"], color="#457b9d")
+    axes[0].axhline(frame["threshold"].iloc[0], color="#e63946", linestyle="--", label="threshold")
+    axes[0].set_ylabel("Rolling Error")
+    axes[0].set_title(f"Decorator Decision Trace: {model_name}")
+    axes[0].legend()
+
+    axes[1].step(frame["index"], frame["mode_flag"], where="post", color="#2a9d8f")
+    axes[1].set_yticks([0, 1], labels=["simulation", "surrogate"])
+    axes[1].set_xlabel("Test Step")
+    axes[1].set_ylabel("Chosen Path")
+
+    fig.tight_layout()
+    fig.savefig(output, dpi=160)
+    plt.close(fig)

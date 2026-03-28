@@ -76,6 +76,18 @@ class EvaluationConfig:
 
 
 @dataclass(slots=True)
+class DecoratorConfig:
+    enabled: bool = True
+    candidate_model_names: list[str] = field(default_factory=lambda: ["lstm", "transformer"])
+    rolling_window: int = 24
+    warmup_steps: int = 32
+    threshold_multipliers: list[float] = field(
+        default_factory=lambda: [0.75, 1.0, 1.25, 1.5]
+    )
+    preferred_threshold_multiplier: float = 1.0
+
+
+@dataclass(slots=True)
 class ExperimentConfig:
     run_name: str = "baseline_v1"
     seed: int = 42
@@ -87,6 +99,7 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    decorator: DecoratorConfig = field(default_factory=DecoratorConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExperimentConfig":
@@ -101,6 +114,8 @@ class ExperimentConfig:
             config.training = _construct_dataclass(TrainingConfig, data["training"])
         if isinstance(data.get("evaluation"), dict):
             config.evaluation = _construct_dataclass(EvaluationConfig, data["evaluation"])
+        if isinstance(data.get("decorator"), dict):
+            config.decorator = _construct_dataclass(DecoratorConfig, data["decorator"])
         return config
 
     @classmethod
@@ -113,4 +128,3 @@ class ExperimentConfig:
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
-

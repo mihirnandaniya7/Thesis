@@ -71,9 +71,14 @@ class SmokePipelineTests(unittest.TestCase):
             self.assertTrue((Path(temp_dir) / "run" / "summary.json").exists())
             self.assertTrue((Path(temp_dir) / "run" / "metrics.csv").exists())
             self.assertTrue((Path(temp_dir) / "run" / "plots" / "prediction_overview.png").exists())
+            self.assertTrue((Path(temp_dir) / "run" / "decorator" / "decorator_summary.csv").exists())
             metrics_text = (Path(temp_dir) / "run" / "metrics.csv").read_text()
             self.assertIn("single_sample_latency_ms", metrics_text)
             self.assertIn("full_test_runtime_ms", metrics_text)
+            self.assertTrue(summary["decorator_results"])
+            decorator_text = (Path(temp_dir) / "run" / "decorator" / "decorator_summary.csv").read_text()
+            self.assertIn("surrogate_usage_ratio", decorator_text)
+            self.assertIn("decorator_speedup", decorator_text)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,18 @@ class DecoratorConfig:
     candidate_model_names: list[str] = field(default_factory=lambda: ["lstm", "transformer"])
     rolling_window: int = 24
     warmup_steps: int = 32
+    validation_interval_steps: int = 12
+    simulation_cooldown_steps: int = 6
+    reentry_probe_interval_steps: int = 3
+    hysteresis_ratio: float = 1.15
+    streaming_inference_threads: int = 1
+    streaming_warmup_calls: int = 32
+    enable_jit_streaming_optimization: bool = True
+    enable_online_recalibration: bool = True
+    recalibration_min_samples: int = 8
+    recalibration_interval_steps: int = 12
+    recalibration_max_samples: int = 256
+    recalibration_ridge: float = 1e-4
     threshold_multipliers: list[float] = field(
         default_factory=lambda: [0.75, 1.0, 1.25, 1.5]
     )

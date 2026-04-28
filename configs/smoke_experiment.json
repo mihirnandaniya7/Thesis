@@ -65,5 +65,32 @@
   "evaluation": {
     "latency_samples": 32,
     "prediction_plot_points": 96
+  },
+  "decorator": {
+    "enabled": true,
+    "candidate_model_names": [
+      "lstm",
+      "transformer"
+    ],
+    "rolling_window": 12,
+    "warmup_steps": 12,
+    "validation_interval_steps": 6,
+    "simulation_cooldown_steps": 3,
+    "reentry_probe_interval_steps": 2,
+    "hysteresis_ratio": 1.1,
+    "streaming_inference_threads": 1,
+    "streaming_warmup_calls": 16,
+    "enable_jit_streaming_optimization": true,
+    "enable_online_recalibration": true,
+    "recalibration_min_samples": 6,
+    "recalibration_interval_steps": 6,
+    "recalibration_max_samples": 128,
+    "recalibration_ridge": 0.0001,
+    "threshold_multipliers": [
+      0.75,
+      1.0,
+      1.25
+    ],
+    "preferred_threshold_multiplier": 1.0
   }
 }

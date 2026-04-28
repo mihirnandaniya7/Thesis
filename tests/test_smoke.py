@@ -79,6 +79,10 @@ class SmokePipelineTests(unittest.TestCase):
             decorator_text = (Path(temp_dir) / "run" / "decorator" / "decorator_summary.csv").read_text()
             self.assertIn("surrogate_usage_ratio", decorator_text)
             self.assertIn("decorator_speedup", decorator_text)
+            self.assertIn("probe_step_ratio", decorator_text)
+            self.assertIn("avg_observed_error", decorator_text)
+            self.assertIn("recalibration_updates", decorator_text)
+            self.assertIn("recalibration_sample_count", decorator_text)
 
 
 if __name__ == "__main__":

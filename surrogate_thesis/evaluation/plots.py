@@ -190,10 +190,32 @@ def plot_decorator_decision_trace(
 
     frame = trace_frame.copy()
     frame["mode_flag"] = frame["mode"].map({"simulation": 0, "surrogate": 1})
+    probe_points = frame[frame["probe_executed"].astype(bool)]
 
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
     axes[0].plot(frame["index"], frame["rolling_error_after"], color="#457b9d")
-    axes[0].axhline(frame["threshold"].iloc[0], color="#e63946", linestyle="--", label="threshold")
+    axes[0].axhline(
+        frame["entry_threshold"].iloc[0],
+        color="#e63946",
+        linestyle="--",
+        label="entry_threshold",
+    )
+    if "exit_threshold" in frame:
+        axes[0].axhline(
+            frame["exit_threshold"].iloc[0],
+            color="#f4a261",
+            linestyle=":",
+            label="exit_threshold",
+        )
+    if not probe_points.empty:
+        axes[0].scatter(
+            probe_points["index"],
+            probe_points["rolling_error_after"],
+            color="#2a9d8f",
+            s=18,
+            label="probe_step",
+            zorder=3,
+        )
     axes[0].set_ylabel("Rolling Error")
     axes[0].set_title(f"Decorator Decision Trace: {model_name}")
     axes[0].legend()

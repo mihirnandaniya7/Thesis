@@ -1,4 +1,4 @@
-# Surrogate Thesis Scaffold
+# Surrogate Thesis 
 
 This repository implements a surrogate-integrated simulation prototype for short-term microgrid forecasting. The current version combines a trusted reference simulator, multiple surrogate models, and a decorator-based switching layer with probe-based trust estimation and lightweight online recalibration.
 

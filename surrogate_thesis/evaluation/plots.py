@@ -97,6 +97,43 @@ def plot_runtime_comparison(metrics_frame: pd.DataFrame, output_path: str | Path
     plt.close()
 
 
+def plot_normalized_error_comparison(metrics_frame: pd.DataFrame, output_path: str | Path) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    frame = metrics_frame.copy()
+    models = frame["model_name"].tolist()
+    x = np.arange(len(models))
+    width = 0.35
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    axes[0].bar(x - width / 2, frame["MAE"], width=width, label="MAE", color="#457b9d")
+    axes[0].bar(x + width / 2, frame["RMSE"], width=width, label="RMSE", color="#e76f51")
+    axes[0].set_xticks(x, labels=models)
+    axes[0].set_ylabel("Error (kW)")
+    axes[0].set_title("Absolute Error Metrics")
+    axes[0].legend()
+
+    normalized_columns = [
+        ("NMAE", "#2a9d8f"),
+        ("NRMSE", "#f4a261"),
+        ("MAPE", "#7b2cbf"),
+    ]
+    offsets = np.linspace(-width, width, num=len(normalized_columns))
+    for offset, (column, color) in zip(offsets, normalized_columns, strict=False):
+        axes[1].bar(x + offset, frame[column], width=width * 0.9, label=column, color=color)
+    axes[1].set_xticks(x, labels=models)
+    axes[1].set_ylabel("Error (%)")
+    axes[1].set_title("Scale-Aware Error Metrics")
+    axes[1].legend()
+
+    fig.suptitle("Absolute vs. Normalized Forecast Error")
+    fig.tight_layout()
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+
+
 def plot_error_by_hour(
     hours: np.ndarray,
     y_true: np.ndarray,

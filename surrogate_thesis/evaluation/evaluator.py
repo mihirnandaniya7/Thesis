@@ -7,7 +7,7 @@ import numpy as np
 
 from surrogate_thesis.config import ExperimentConfig
 from surrogate_thesis.data.dataset import DatasetSplit, NormalizationStats
-from surrogate_thesis.evaluation.metrics import mae, rmse, smape
+from surrogate_thesis.evaluation.metrics import mae, mape, nmae, nrmse, rmse, smape
 from surrogate_thesis.training import ModelArtifacts, predict_model
 
 
@@ -64,7 +64,10 @@ def evaluate_model(
     metrics = {
         "MAE": mae(y_true, y_pred),
         "RMSE": rmse(y_true, y_pred),
+        "MAPE": mape(y_true, y_pred),
         "sMAPE": smape(y_true, y_pred),
+        "NMAE": nmae(y_true, y_pred),
+        "NRMSE": nrmse(y_true, y_pred),
         "latency_ms": batch_metrics["per_sample_latency_ms"],
         "single_sample_latency_ms": single_sample_latency_ms,
         "batch_latency_ms": batch_metrics["per_sample_latency_ms"],

@@ -9,9 +9,9 @@ dependencies = [
   "scikit-learn",
   "matplotlib",
   "torch",
+  "python-pptx",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-

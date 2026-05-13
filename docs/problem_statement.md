@@ -218,7 +218,10 @@ The evaluation includes:
 
 - MAE
 - RMSE
+- MAPE
 - sMAPE
+- NMAE
+- NRMSE
 - runtime per step
 - full-run runtime
 - speedup
@@ -260,7 +263,10 @@ The system is evaluated on two axes:
 1. Predictive fidelity:
    - MAE
    - RMSE
+   - MAPE
    - sMAPE
+   - NMAE
+   - NRMSE
    - output-trace agreement with the reference simulator
 2. Computational efficiency:
    - single-step latency

@@ -12,7 +12,7 @@ import torch
 
 from surrogate_thesis.config import ExperimentConfig
 from surrogate_thesis.data.dataset import DatasetSplit, NormalizationStats
-from surrogate_thesis.evaluation.metrics import mae
+from surrogate_thesis.evaluation.metrics import mae, mape, nmae, nrmse, rmse, smape
 from surrogate_thesis.training import ModelArtifacts, predict_model
 
 from .hybrid_controller import HybridController
@@ -217,6 +217,9 @@ class SurrogateDecorator:
         base_surrogate_step_errors: list[float] = []
         surrogate_step_errors: list[float] = []
         observed_errors: list[float] = []
+        base_surrogate_outputs: list[np.ndarray] = []
+        managed_surrogate_outputs: list[np.ndarray] = []
+        effective_outputs: list[np.ndarray] = []
 
         total_steps = len(self.surrogate.y_pred)
         for index in range(total_steps):
@@ -231,6 +234,8 @@ class SurrogateDecorator:
             surrogate_error = float(np.mean(np.abs(surrogate_prediction - true_value)))
             base_surrogate_step_errors.append(base_surrogate_error)
             surrogate_step_errors.append(surrogate_error)
+            base_surrogate_outputs.append(np.asarray(base_surrogate_prediction, dtype=np.float32).copy())
+            managed_surrogate_outputs.append(np.asarray(surrogate_prediction, dtype=np.float32).copy())
 
             rolling_error_before = tracker.mean_error
             steps_since_last_observation = tracker.steps_since_last_observation(index)
@@ -325,6 +330,7 @@ class SurrogateDecorator:
 
             effective_error = float(np.mean(np.abs(output - true_value)))
             effective_step_errors.append(effective_error)
+            effective_outputs.append(np.asarray(output, dtype=np.float32).copy())
             if not np.isnan(observed_error):
                 observed_errors.append(observed_error)
 
@@ -368,16 +374,33 @@ class SurrogateDecorator:
 
         simulator_total_runtime_ms = float(np.sum(self.simulator.runtime_ms))
         surrogate_total_runtime_ms = float(np.sum(self.surrogate.runtime_ms))
-        pure_surrogate_mae = float(np.mean(base_surrogate_step_errors))
-        managed_surrogate_mae = float(np.mean(surrogate_step_errors))
+        y_true = np.asarray(self.simulator.y_true, dtype=np.float32)
+        base_surrogate_array = np.asarray(base_surrogate_outputs, dtype=np.float32)
+        managed_surrogate_array = np.asarray(managed_surrogate_outputs, dtype=np.float32)
+        effective_output_array = np.asarray(effective_outputs, dtype=np.float32)
+        pure_surrogate_mae = mae(y_true, base_surrogate_array)
+        managed_surrogate_mae = mae(y_true, managed_surrogate_array)
+        decorator_mae = mae(y_true, effective_output_array)
         metrics = {
             "threshold_multiplier": float(threshold_multiplier),
             "pure_surrogate_mae": pure_surrogate_mae,
+            "pure_surrogate_mape": mape(y_true, base_surrogate_array),
+            "pure_surrogate_smape": smape(y_true, base_surrogate_array),
+            "pure_surrogate_nmae": nmae(y_true, base_surrogate_array),
+            "pure_surrogate_nrmse": nrmse(y_true, base_surrogate_array),
             "managed_surrogate_mae": managed_surrogate_mae,
-            "decorator_mae": float(np.mean(effective_step_errors)),
-            "decorator_rmse": float(np.sqrt(np.mean(np.square(effective_step_errors)))),
+            "managed_surrogate_mape": mape(y_true, managed_surrogate_array),
+            "managed_surrogate_smape": smape(y_true, managed_surrogate_array),
+            "managed_surrogate_nmae": nmae(y_true, managed_surrogate_array),
+            "managed_surrogate_nrmse": nrmse(y_true, managed_surrogate_array),
+            "decorator_mae": decorator_mae,
+            "decorator_rmse": rmse(y_true, effective_output_array),
+            "decorator_mape": mape(y_true, effective_output_array),
+            "decorator_smape": smape(y_true, effective_output_array),
+            "decorator_nmae": nmae(y_true, effective_output_array),
+            "decorator_nrmse": nrmse(y_true, effective_output_array),
             "recalibration_improvement": float(pure_surrogate_mae - managed_surrogate_mae),
-            "fallback_improvement": float(managed_surrogate_mae - np.mean(effective_step_errors)),
+            "fallback_improvement": float(managed_surrogate_mae - decorator_mae),
             "surrogate_usage_ratio": float(surrogate_steps / total_steps),
             "simulation_usage_ratio": float(simulation_steps / total_steps),
             "observation_step_ratio": float(observed_steps / total_steps),

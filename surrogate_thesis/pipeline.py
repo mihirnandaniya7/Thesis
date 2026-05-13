@@ -18,6 +18,7 @@ from surrogate_thesis.evaluation.plots import (
     plot_decorator_decision_trace,
     plot_decorator_threshold_sensitivity,
     plot_error_by_hour,
+    plot_normalized_error_comparison,
     plot_prediction_overview,
     plot_residual_overview,
     plot_runtime_comparison,
@@ -96,6 +97,10 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
     plot_runtime_comparison(
         metrics_frame=metrics_frame,
         output_path=plots_dir / "runtime_comparison.png",
+    )
+    plot_normalized_error_comparison(
+        metrics_frame=metrics_frame,
+        output_path=plots_dir / "normalized_error_comparison.png",
     )
     plot_error_by_hour(
         hours=dataset.test.target_hours,

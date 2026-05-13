@@ -75,6 +75,7 @@ Each experiment writes:
 - metrics summary
 - prediction and residual plots
 - runtime comparison plot
+- normalized error comparison plot
 - error-by-hour plot
 - decorator threshold sensitivity and decision traces
 
@@ -97,6 +98,8 @@ Each experiment writes:
 
 The evaluation now reports:
 
+- MAE, RMSE, MAPE, sMAPE
+- NMAE and NRMSE normalized by the mean absolute target magnitude
 - single-sample latency
 - batched per-sample latency
 - full test-set runtime

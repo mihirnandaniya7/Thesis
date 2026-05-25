@@ -82,6 +82,7 @@ class DecoratorConfig:
     rolling_window: int = 24
     warmup_steps: int = 32
     validation_interval_steps: int = 12
+    max_validation_interval_steps: int = 36
     simulation_cooldown_steps: int = 6
     reentry_probe_interval_steps: int = 3
     hysteresis_ratio: float = 1.15

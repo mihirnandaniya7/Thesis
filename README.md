@@ -1,6 +1,6 @@
-# Surrogate Thesis 
+# Surrogate Modeling Based on Machine Learning Approaches for Hospitals as Microgrids
 
-This repository implements a surrogate-integrated simulation prototype for short-term microgrid forecasting. The current version combines a trusted reference simulator, multiple surrogate models, and a decorator-based switching layer with probe-based trust estimation and lightweight online recalibration.
+This repository implements a surrogate-integrated simulation prototype for short-term microgrid forecasting. The current version combines a trusted reference simulator, multiple surrogate models, and a real decorator-based runtime layer with probe-based trust estimation and lightweight online recalibration.
 
 The implemented workflow is:
 
@@ -33,7 +33,7 @@ For code review, the most important files are:
 - `surrogate_thesis/data/dataset.py`: window construction and normalization
 - `surrogate_thesis/training/trainer.py`: offline model training
 - `surrogate_thesis/controller/hybrid_controller.py`: switching policy
-- `surrogate_thesis/controller/surrogate_decorator.py`: runtime decorator, probing, fallback, and online recalibration
+- `surrogate_thesis/controller/surrogate_decorator.py`: common forecast interface, runtime decorators, probing, fallback, recalibration, and evaluation runner
 - `tests/test_decorator.py`: focused decorator tests
 
 ## Quick Start
@@ -107,14 +107,20 @@ The evaluation now reports:
 
 ## Decorator Runtime Supervision
 
-The decorator layer now supports:
+The runtime architecture uses a common `ForecastProvider.forecast(index)` interface. The high-fidelity simulator adapter, surrogate adapter, recalibration decorator, and trust-managed surrogate decorator all expose this same interface, so the decorated provider can be used as a transparent replacement by the evaluation loop.
+
+The decorator layer supports:
 
 - probe-based trust estimation
+- adaptive probe spacing when the surrogate remains stable
 - fallback to the reference simulator under low trust
 - lightweight online recalibration from trusted high-fidelity labels
 
-At runtime, the decorator does three things:
+At runtime, the decorator does four things:
 
 1. selects whether the next-step metric comes from the surrogate or the high-fidelity simulator
-2. updates trust from periodic probe comparisons against trusted simulator outputs
-3. uses trusted high-fidelity labels to recalibrate surrogate predictions online
+2. executes the high-fidelity simulator lazily only on warmup, probe, fallback, or re-entry steps
+3. updates trust from periodic probe comparisons against trusted simulator outputs
+4. uses trusted high-fidelity labels to recalibrate surrogate predictions online
+
+The experiment runner is intentionally separate from the runtime decorator. It iterates over the test split, collects traces, computes metrics, and uses the offline test ground truth only for final evaluation. Switching thresholds are calibrated from the validation split, not from the test split.

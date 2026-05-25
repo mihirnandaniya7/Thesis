@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -8,6 +9,7 @@ class HybridController:
     threshold: float = 0.15
     hysteresis_ratio: float = 1.15
     validation_interval_steps: int = 12
+    max_validation_interval_steps: int = 36
     simulation_cooldown_steps: int = 6
     reentry_probe_interval_steps: int = 3
 
@@ -36,9 +38,29 @@ class HybridController:
         current_mode: str,
         steps_since_last_observation: int,
         cooldown_remaining: int,
+        error_estimate: float | None = None,
+        allow_relaxed_interval: bool = True,
     ) -> bool:
         if current_mode == "surrogate":
-            return steps_since_last_observation >= self.validation_interval_steps
+            interval = (
+                self.validation_interval_for_error(error_estimate)
+                if allow_relaxed_interval
+                else max(int(self.validation_interval_steps), 1)
+            )
+            return steps_since_last_observation >= interval
         if cooldown_remaining > 0:
             return False
         return steps_since_last_observation >= self.reentry_probe_interval_steps
+
+    def validation_interval_for_error(self, error_estimate: float | None) -> int:
+        base_interval = max(int(self.validation_interval_steps), 1)
+        max_interval = max(int(self.max_validation_interval_steps), base_interval)
+        if error_estimate is None or not math.isfinite(error_estimate) or error_estimate <= 0.0:
+            return base_interval
+
+        normalized_error = error_estimate / max(self.entry_threshold, 1e-9)
+        if normalized_error <= 0.5:
+            return max_interval
+        if normalized_error <= 0.8:
+            return min(max_interval, base_interval * 2)
+        return base_interval

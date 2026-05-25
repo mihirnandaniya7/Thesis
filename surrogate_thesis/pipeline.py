@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from surrogate_thesis.config import ExperimentConfig
-from surrogate_thesis.controller import HybridController, evaluate_decorator_thresholds
+from surrogate_thesis.controller import evaluate_decorator_thresholds
 from surrogate_thesis.data import prepare_dataset, save_dataset_artifacts
 from surrogate_thesis.evaluation import evaluate_model
 from surrogate_thesis.evaluation.plots import (
@@ -110,7 +110,6 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
     )
 
     best_model_row = metrics_frame.iloc[0]
-    controller = HybridController(threshold=float(best_model_row["MAE"]) * 1.1)
     decorator_summary_records = []
     if config.decorator.enabled:
         candidate_names = [
@@ -121,6 +120,7 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
         for model_name in candidate_names:
             decorator_artifacts = evaluate_decorator_thresholds(
                 artifacts=model_artifacts[model_name],
+                calibration_split=dataset.val,
                 test_split=dataset.test,
                 normalization=dataset.normalization,
                 config=config,
@@ -157,7 +157,6 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
         "run_name": config.run_name,
         "output_dir": str(resolved_output),
         "best_model": str(best_model_row["model_name"]),
-        "controller_demo_decision": controller.decide(float(best_model_row["MAE"])),
         "metrics": metrics_frame.to_dict(orient="records"),
         "decorator_results": decorator_summary_records,
         "generated_at": datetime.now(UTC).isoformat(),

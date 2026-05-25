@@ -6,7 +6,9 @@ import numpy as np
 
 from surrogate_thesis.controller.hybrid_controller import HybridController
 from surrogate_thesis.controller.surrogate_decorator import (
+    DecoratorEvaluationRunner,
     HighFidelitySimulationAdapter,
+    RecalibratingForecastDecorator,
     SurrogateDecorator,
     SurrogateModelAdapter,
 )
@@ -40,6 +42,45 @@ def _make_adapters(
     )
 
 
+def _run_decorator(
+    *,
+    simulator: HighFidelitySimulationAdapter,
+    surrogate: SurrogateModelAdapter,
+    controller: HybridController,
+    rolling_window: int,
+    warmup_steps: int,
+    model_name: str,
+    threshold_multiplier: float = 1.0,
+    enable_recalibration: bool = False,
+) -> object:
+    runtime_surrogate = surrogate
+    if enable_recalibration:
+        runtime_surrogate = RecalibratingForecastDecorator(
+            runtime_surrogate,
+            min_samples=2,
+            update_interval_steps=1,
+            max_samples=32,
+            ridge=1e-6,
+        )
+    decorator = SurrogateDecorator(
+        simulator=simulator,
+        surrogate=runtime_surrogate,
+        controller=controller,
+        rolling_window=rolling_window,
+        warmup_steps=warmup_steps,
+    )
+    runner = DecoratorEvaluationRunner(
+        provider=decorator,
+        simulator=simulator,
+        surrogate=surrogate,
+        calibration_error=controller.threshold,
+    )
+    return runner.run(
+        model_name=model_name,
+        threshold_multiplier=threshold_multiplier,
+    )
+
+
 class DecoratorTests(unittest.TestCase):
     def test_decorator_managed_recalibration_uses_trusted_labels_to_improve_surrogate(self) -> None:
         y_true = np.array(
@@ -49,7 +90,7 @@ class DecoratorTests(unittest.TestCase):
         y_pred = 0.72 * y_true + 0.18
         simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
 
-        without_recalibration = SurrogateDecorator(
+        without_recalibration = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -60,9 +101,10 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=2,
             warmup_steps=2,
-        ).run(model_name="no_recalibration", threshold_multiplier=1.0)
+            model_name="no_recalibration",
+        )
 
-        with_recalibration = SurrogateDecorator(
+        with_recalibration = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -73,12 +115,9 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=2,
             warmup_steps=2,
-            enable_online_recalibration=True,
-            recalibration_min_samples=2,
-            recalibration_interval_steps=1,
-            recalibration_max_samples=32,
-            recalibration_ridge=1e-6,
-        ).run(model_name="with_recalibration", threshold_multiplier=1.0)
+            model_name="with_recalibration",
+            enable_recalibration=True,
+        )
 
         self.assertGreater(with_recalibration.metrics["recalibration_updates"], 0.0)
         self.assertGreater(with_recalibration.metrics["recalibration_sample_count"], 0.0)
@@ -92,7 +131,7 @@ class DecoratorTests(unittest.TestCase):
         y_pred = np.array([[1.05], [1.08], [1.06], [1.45], [1.02]], dtype=np.float32)
         simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
 
-        decorator = SurrogateDecorator(
+        result = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -104,9 +143,8 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=2,
             warmup_steps=2,
+            model_name="unit_model",
         )
-
-        result = decorator.run(model_name="unit_model", threshold_multiplier=1.0)
 
         modes = result.trace["mode"].tolist()
         reasons = result.trace["reason"].tolist()
@@ -126,7 +164,7 @@ class DecoratorTests(unittest.TestCase):
         y_pred = np.array([[1.08], [1.05], [1.07], [1.12], [1.10], [1.02]], dtype=np.float32)
         simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
 
-        strict = SurrogateDecorator(
+        strict = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -137,9 +175,11 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=3,
             warmup_steps=1,
-        ).run(model_name="strict", threshold_multiplier=0.8)
+            model_name="strict",
+            threshold_multiplier=0.8,
+        )
 
-        lenient = SurrogateDecorator(
+        lenient = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -150,7 +190,9 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=3,
             warmup_steps=1,
-        ).run(model_name="lenient", threshold_multiplier=1.5)
+            model_name="lenient",
+            threshold_multiplier=1.5,
+        )
 
         self.assertGreater(
             lenient.metrics["surrogate_usage_ratio"],
@@ -165,7 +207,7 @@ class DecoratorTests(unittest.TestCase):
         )
         simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
 
-        result = SurrogateDecorator(
+        result = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -176,11 +218,59 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=3,
             warmup_steps=2,
-        ).run(model_name="periodic_probe", threshold_multiplier=1.0)
+            model_name="periodic_probe",
+        )
 
         self.assertLess(result.metrics["probe_step_ratio"], 1.0)
         self.assertLess(result.metrics["observation_step_ratio"], 1.0)
         self.assertIn("trusted_surrogate", result.trace["reason"].tolist())
+        trusted_rows = result.trace[result.trace["reason"] == "trusted_surrogate"]
+        self.assertFalse(trusted_rows["simulation_executed"].any())
+        self.assertTrue((trusted_rows["simulation_runtime_ms"] == 0.0).all())
+
+    def test_adaptive_probe_spacing_reduces_probe_ratio_when_error_is_small(self) -> None:
+        y_true = np.ones((30, 1), dtype=np.float32)
+        y_pred = np.full((30, 1), 1.01, dtype=np.float32)
+        simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
+
+        fixed = _run_decorator(
+            simulator=simulator,
+            surrogate=surrogate,
+            controller=HybridController(
+                threshold=0.05,
+                validation_interval_steps=3,
+                max_validation_interval_steps=3,
+                simulation_cooldown_steps=1,
+                reentry_probe_interval_steps=1,
+            ),
+            rolling_window=3,
+            warmup_steps=2,
+            model_name="fixed_probe",
+        )
+
+        adaptive = _run_decorator(
+            simulator=simulator,
+            surrogate=surrogate,
+            controller=HybridController(
+                threshold=0.05,
+                validation_interval_steps=3,
+                max_validation_interval_steps=9,
+                simulation_cooldown_steps=1,
+                reentry_probe_interval_steps=1,
+            ),
+            rolling_window=3,
+            warmup_steps=2,
+            model_name="adaptive_probe",
+        )
+
+        self.assertLess(
+            adaptive.metrics["probe_step_ratio"],
+            fixed.metrics["probe_step_ratio"],
+        )
+        self.assertGreaterEqual(
+            adaptive.metrics["surrogate_usage_ratio"],
+            fixed.metrics["surrogate_usage_ratio"],
+        )
 
     def test_cooldown_prevents_immediate_return_to_surrogate(self) -> None:
         y_true = np.ones((7, 1), dtype=np.float32)
@@ -190,7 +280,7 @@ class DecoratorTests(unittest.TestCase):
         )
         simulator, surrogate = _make_adapters(y_true=y_true, y_pred=y_pred)
 
-        result = SurrogateDecorator(
+        result = _run_decorator(
             simulator=simulator,
             surrogate=surrogate,
             controller=HybridController(
@@ -202,7 +292,8 @@ class DecoratorTests(unittest.TestCase):
             ),
             rolling_window=2,
             warmup_steps=2,
-        ).run(model_name="cooldown", threshold_multiplier=1.0)
+            model_name="cooldown",
+        )
 
         reasons = result.trace["reason"].tolist()
         fallback_index = reasons.index("validation_probe_fallback")

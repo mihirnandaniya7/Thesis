@@ -75,6 +75,7 @@
     "rolling_window": 12,
     "warmup_steps": 12,
     "validation_interval_steps": 6,
+    "max_validation_interval_steps": 18,
     "simulation_cooldown_steps": 3,
     "reentry_probe_interval_steps": 2,
     "hysteresis_ratio": 1.1,

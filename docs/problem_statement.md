@@ -2,7 +2,7 @@
 
 ## Title
 
-Surrogate Modeling Based on Machine Learning Approaches for Short-Term Load Forecasting in Microgrids
+Surrogate Modeling Based on Machine Learning Approaches for Hospitals as Microgrids
 
 ## Motivation
 
@@ -150,16 +150,18 @@ This stage yields a trained surrogate candidate `f_\theta` that can subsequently
 
 ### 6. Decorator-Managed Runtime Integration
 
-After offline training, runtime execution is organized around a decorator that wraps two alternative implementations of the same functional role:
+After offline training, runtime execution is organized around a common forecast-provider interface. The high-fidelity simulator, the learned surrogate, and the decorated surrogate all expose the same operation:
 
-- the high-fidelity simulator
-- the learned surrogate
+`forecast(k) -> y_{k+1}`
 
-At every time step `k`, the decorator first decides whether the next-step metric should be produced by the high-fidelity path or by the surrogate path. This decision is therefore the entry point of runtime execution.
+This preserves substitutability: a client that requests a forecast does not need to know whether the returned value comes from the raw simulator, the raw surrogate, or a decorated surrogate with trust management. The decorator therefore acts as a runtime architectural component rather than as an offline analysis script.
 
-If the decorator selects the high-fidelity simulator, the system obtains the trusted output `y_{k+1}^{HF}`. This value is used as the official output for the current step and also provides an additional trusted labeled sample for supervision.
+The implementation separates two roles:
 
-If the decorator selects the surrogate, the system obtains the fast prediction `\hat{y}_{k+1}`, which becomes the provisional output unless a probe check is triggered.
+- runtime providers and decorators, which implement `forecast(k)`
+- an evaluation runner, which iterates over a dataset, records traces, and computes thesis metrics
+
+At every time step `k`, the trust-managed decorator decides which provider must actually be executed. If the high-fidelity simulator is selected, the trusted output `y_{k+1}^{HF}` is used as the official output for that step. If the surrogate is selected and no probe is due, only the surrogate is executed and `\hat{y}_{k+1}` is returned. The high-fidelity simulator is executed lazily only during warmup, probing, fallback, or re-entry checks.
 
 ### 7. Probe-Based Trust Estimation
 
@@ -167,7 +169,7 @@ The surrogate is not compared against the high-fidelity simulator at every time 
 
 `e_k = || \hat{y}_{k+1} - y_{k+1}^{HF} || , \quad k \in P`
 
-This makes explicit that the prediction error is only directly observable on probe steps or on steps where the high-fidelity path is already active.
+This makes explicit that the prediction error is only directly observable on probe steps or on steps where the high-fidelity path is actually executed. On surrogate-only steps, the runtime decorator does not know the high-fidelity answer and therefore cannot update the observed error from test ground truth.
 
 To obtain a stable trust signal, the system maintains a rolling error estimate over the most recent probe steps. Let `W_k` denote the rolling probe window. Then:
 
@@ -187,7 +189,7 @@ If the rolling error exceeds the threshold, the system falls back to the high-fi
 
 `\bar{e}_k > \varepsilon`
 
-In the current implementation, this policy is refined through:
+The switching threshold is calibrated before final test evaluation using the validation split rather than the test split. This avoids selecting the runtime policy from final test-set information. In the current implementation, the policy is refined through:
 
 - periodic validation probes
 - rolling error tracking
@@ -213,6 +215,8 @@ The final stage evaluates the resulting system along two complementary axes:
 
 1. predictive fidelity relative to the high-fidelity simulator
 2. computational efficiency relative to simulator-only execution
+
+For clean evaluation, the validation split is used for threshold calibration, while the test split is reserved for final reporting. During test execution, offline ground truth is used by the evaluation runner to compute metrics, but it is not used by the runtime decorator to make surrogate-versus-simulator decisions.
 
 The evaluation includes:
 

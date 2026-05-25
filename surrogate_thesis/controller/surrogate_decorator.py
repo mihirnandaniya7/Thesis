@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from time import perf_counter
+from typing import Any, Protocol
 import warnings
 
 import numpy as np
@@ -19,14 +20,45 @@ from .hybrid_controller import HybridController
 
 
 @dataclass(slots=True)
+class ForecastResult:
+    value: np.ndarray
+    runtime_ms: float
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ForecastProvider(Protocol):
+    """Common runtime interface for raw and decorated forecast providers."""
+
+    def forecast(self, index: int) -> ForecastResult:
+        ...
+
+
+@dataclass(slots=True)
 class HighFidelitySimulationAdapter:
     y_true: np.ndarray
     runtime_ms: np.ndarray
     timestamps: np.ndarray
     hours: np.ndarray
 
-    def forecast(self, index: int) -> tuple[np.ndarray, float]:
-        return self.y_true[index], float(self.runtime_ms[index])
+    def forecast(self, index: int) -> ForecastResult:
+        return ForecastResult(
+            value=self.value_at(index),
+            runtime_ms=float(self.runtime_ms[index]),
+            source="simulation",
+            metadata={
+                "timestamp": self.timestamps[index],
+                "hour": float(self.hours[index]),
+                "simulation_executed": True,
+                "surrogate_executed": False,
+            },
+        )
+
+    def value_at(self, index: int) -> np.ndarray:
+        return np.asarray(self.y_true[index], dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.y_true)
 
 
 @dataclass(slots=True)
@@ -34,8 +66,23 @@ class SurrogateModelAdapter:
     y_pred: np.ndarray
     runtime_ms: np.ndarray
 
-    def forecast(self, index: int) -> tuple[np.ndarray, float]:
-        return self.y_pred[index], float(self.runtime_ms[index])
+    def forecast(self, index: int) -> ForecastResult:
+        return ForecastResult(
+            value=self.value_at(index),
+            runtime_ms=float(self.runtime_ms[index]),
+            source="surrogate",
+            metadata={
+                "simulation_executed": False,
+                "surrogate_executed": True,
+                "base_prediction": self.value_at(index).copy(),
+            },
+        )
+
+    def value_at(self, index: int) -> np.ndarray:
+        return np.asarray(self.y_pred[index], dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.y_pred)
 
 
 @dataclass(slots=True)
@@ -111,6 +158,83 @@ class OnlineRecalibrationManager:
         self.intercept = intercepts
 
 
+class ForecastProviderDecorator:
+    """Base decorator: same interface as the wrapped provider."""
+
+    def __init__(self, wrapped: ForecastProvider) -> None:
+        self.wrapped = wrapped
+
+    def forecast(self, index: int) -> ForecastResult:
+        return self.wrapped.forecast(index)
+
+
+class RecalibratingForecastDecorator(ForecastProviderDecorator):
+    """Applies a lightweight linear correction learned from trusted labels."""
+
+    def __init__(
+        self,
+        wrapped: ForecastProvider,
+        *,
+        min_samples: int,
+        update_interval_steps: int,
+        max_samples: int,
+        ridge: float,
+    ) -> None:
+        super().__init__(wrapped)
+        self.manager = OnlineRecalibrationManager(
+            min_samples=min_samples,
+            update_interval_steps=update_interval_steps,
+            max_samples=max_samples,
+            ridge=ridge,
+        )
+
+    def forecast(self, index: int) -> ForecastResult:
+        result = self.wrapped.forecast(index)
+        base_prediction = np.asarray(
+            result.metadata.get("base_prediction", result.value),
+            dtype=np.float32,
+        )
+        adjusted_prediction = self.manager.transform(base_prediction)
+        metadata = {
+            **result.metadata,
+            "base_prediction": base_prediction.copy(),
+            "recalibration_active": self.manager.is_active,
+            "recalibration_sample_count": float(self.manager.sample_count),
+            "recalibration_updates": float(self.manager.update_count),
+        }
+        return ForecastResult(
+            value=adjusted_prediction,
+            runtime_ms=result.runtime_ms,
+            source=result.source,
+            metadata=metadata,
+        )
+
+    def observe_trusted_label(
+        self,
+        *,
+        step_index: int,
+        base_prediction: np.ndarray,
+        target: np.ndarray,
+    ) -> bool:
+        return self.manager.observe(
+            step_index=step_index,
+            base_prediction=base_prediction,
+            target=target,
+        )
+
+    @property
+    def update_count(self) -> int:
+        return self.manager.update_count
+
+    @property
+    def sample_count(self) -> int:
+        return self.manager.sample_count
+
+    @property
+    def is_active(self) -> bool:
+        return self.manager.is_active
+
+
 @dataclass(slots=True)
 class RollingErrorTracker:
     window_size: int
@@ -141,6 +265,232 @@ class RollingErrorTracker:
         return step_index - self.last_observed_step
 
 
+class SurrogateDecorator(ForecastProviderDecorator):
+    """Trust-managed runtime decorator with lazy simulator execution."""
+
+    def __init__(
+        self,
+        surrogate: ForecastProvider,
+        simulator: ForecastProvider,
+        controller: HybridController,
+        rolling_window: int,
+        warmup_steps: int,
+    ) -> None:
+        super().__init__(surrogate)
+        self.surrogate = surrogate
+        self.simulator = simulator
+        self.controller = controller
+        self.rolling_window = rolling_window
+        self.warmup_steps = warmup_steps
+        self.reset()
+
+    def reset(self) -> None:
+        self.tracker = RollingErrorTracker(window_size=self.rolling_window)
+        self.selected_path_previous: str | None = None
+        self.controller_mode = "simulation"
+        self.cooldown_remaining = 0
+        self.surrogate_validation_count = 0
+        self.switch_count = 0
+
+    def forecast(self, index: int) -> ForecastResult:
+        rolling_error_before = self.tracker.mean_error
+        steps_since_last_observation = self.tracker.steps_since_last_observation(index)
+        cooldown_before = self.cooldown_remaining
+        probe_executed = False
+        observed_error = float("nan")
+        surrogate_result: ForecastResult | None = None
+        simulation_result: ForecastResult | None = None
+        rolling_error_after = rolling_error_before
+        reason = "simulation_hold"
+
+        if index < self.warmup_steps:
+            surrogate_result = self.surrogate.forecast(index)
+            simulation_result = self.simulator.forecast(index)
+            probe_executed = True
+            observed_error = _mean_absolute_error(surrogate_result.value, simulation_result.value)
+            rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+            selected_path = "simulation"
+            reason = "warmup_probe"
+            self.controller_mode = self.controller.decide(
+                rolling_error_after,
+                current_mode="simulation",
+            )
+        elif self.controller_mode == "surrogate":
+            if self.controller.should_probe(
+                current_mode=self.controller_mode,
+                steps_since_last_observation=steps_since_last_observation,
+                cooldown_remaining=self.cooldown_remaining,
+                error_estimate=rolling_error_before,
+                allow_relaxed_interval=self.surrogate_validation_count > 0,
+            ):
+                surrogate_result = self.surrogate.forecast(index)
+                simulation_result = self.simulator.forecast(index)
+                probe_executed = True
+                observed_error = _mean_absolute_error(surrogate_result.value, simulation_result.value)
+                rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+                if self.controller.should_fallback_to_simulation(rolling_error_after):
+                    selected_path = "simulation"
+                    reason = "validation_probe_fallback"
+                    self.controller_mode = "simulation"
+                    self.cooldown_remaining = self.controller.simulation_cooldown_steps
+                else:
+                    selected_path = "surrogate"
+                    reason = "validation_probe_keep"
+                self.surrogate_validation_count += 1
+            else:
+                surrogate_result = self.surrogate.forecast(index)
+                selected_path = "surrogate"
+                reason = "trusted_surrogate"
+        elif self.cooldown_remaining > 0:
+            simulation_result = self.simulator.forecast(index)
+            selected_path = "simulation"
+            reason = "simulation_cooldown"
+            self.cooldown_remaining -= 1
+        elif self.controller.should_probe(
+            current_mode=self.controller_mode,
+            steps_since_last_observation=steps_since_last_observation,
+            cooldown_remaining=self.cooldown_remaining,
+            error_estimate=rolling_error_before,
+        ):
+            surrogate_result = self.surrogate.forecast(index)
+            simulation_result = self.simulator.forecast(index)
+            probe_executed = True
+            observed_error = _mean_absolute_error(surrogate_result.value, simulation_result.value)
+            rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+            if self.controller.should_enter_surrogate(rolling_error_after):
+                selected_path = "surrogate"
+                reason = "reentry_probe_accept"
+                self.controller_mode = "surrogate"
+            else:
+                selected_path = "simulation"
+                reason = "reentry_probe_reject"
+        else:
+            simulation_result = self.simulator.forecast(index)
+            selected_path = "simulation"
+            reason = "simulation_hold"
+
+        if surrogate_result is not None and simulation_result is not None:
+            recalibration_updated = self._observe_trusted_label(
+                step_index=index,
+                surrogate_result=surrogate_result,
+                simulation_result=simulation_result,
+            )
+        else:
+            recalibration_updated = False
+
+        if selected_path == "surrogate":
+            if surrogate_result is None:
+                surrogate_result = self.surrogate.forecast(index)
+            selected_result = surrogate_result
+        else:
+            if simulation_result is None:
+                simulation_result = self.simulator.forecast(index)
+            selected_result = simulation_result
+
+        if self.selected_path_previous is not None and self.selected_path_previous != selected_path:
+            self.switch_count += 1
+        self.selected_path_previous = selected_path
+
+        metadata = {
+            "index": index,
+            "mode": selected_path,
+            "controller_mode": self.controller_mode,
+            "reason": reason,
+            "probe_executed": probe_executed,
+            "cooldown_remaining_before": float(cooldown_before),
+            "cooldown_remaining_after": float(self.cooldown_remaining),
+            "steps_since_last_observation": float(steps_since_last_observation),
+            "entry_threshold": float(self.controller.entry_threshold),
+            "exit_threshold": float(self.controller.exit_threshold),
+            "threshold": float(self.controller.threshold),
+            "rolling_error_before": rolling_error_before,
+            "rolling_error_after": rolling_error_after,
+            "observed_error": observed_error,
+            "simulation_executed": simulation_result is not None,
+            "surrogate_executed": surrogate_result is not None,
+            "simulation_runtime_ms": (
+                float(simulation_result.runtime_ms) if simulation_result is not None else 0.0
+            ),
+            "surrogate_runtime_ms": (
+                float(surrogate_result.runtime_ms) if surrogate_result is not None else 0.0
+            ),
+            "surrogate_prediction": (
+                surrogate_result.value.copy() if surrogate_result is not None else None
+            ),
+            "base_surrogate_prediction": (
+                np.asarray(
+                    surrogate_result.metadata.get("base_prediction", surrogate_result.value),
+                    dtype=np.float32,
+                ).copy()
+                if surrogate_result is not None
+                else None
+            ),
+            "recalibration_active": self._recalibration_active,
+            "recalibration_updated": recalibration_updated,
+            "recalibration_updates": float(self._recalibration_updates),
+            "recalibration_sample_count": float(self._recalibration_sample_count),
+            "switch_count": float(self.switch_count),
+        }
+        timestamp = (
+            simulation_result.metadata.get("timestamp")
+            if simulation_result is not None
+            else selected_result.metadata.get("timestamp")
+        )
+        hour = (
+            simulation_result.metadata.get("hour")
+            if simulation_result is not None
+            else selected_result.metadata.get("hour")
+        )
+        if timestamp is not None:
+            metadata["timestamp"] = timestamp
+        if hour is not None:
+            metadata["hour"] = hour
+
+        return ForecastResult(
+            value=np.asarray(selected_result.value, dtype=np.float32),
+            runtime_ms=float(
+                (surrogate_result.runtime_ms if surrogate_result is not None else 0.0)
+                + (simulation_result.runtime_ms if simulation_result is not None else 0.0)
+            ),
+            source=selected_path,
+            metadata=metadata,
+        )
+
+    def _observe_trusted_label(
+        self,
+        *,
+        step_index: int,
+        surrogate_result: ForecastResult,
+        simulation_result: ForecastResult,
+    ) -> bool:
+        observer = getattr(self.surrogate, "observe_trusted_label", None)
+        if observer is None:
+            return False
+        base_prediction = np.asarray(
+            surrogate_result.metadata.get("base_prediction", surrogate_result.value),
+            dtype=np.float32,
+        )
+        return bool(
+            observer(
+                step_index=step_index,
+                base_prediction=base_prediction,
+                target=simulation_result.value,
+            )
+        )
+
+    @property
+    def _recalibration_updates(self) -> int:
+        return int(getattr(self.surrogate, "update_count", 0))
+
+    @property
+    def _recalibration_sample_count(self) -> int:
+        return int(getattr(self.surrogate, "sample_count", 0))
+
+    @property
+    def _recalibration_active(self) -> bool:
+        return bool(getattr(self.surrogate, "is_active", False))
+
+
 @dataclass(slots=True)
 class DecoratorRunResult:
     model_name: str
@@ -160,178 +510,77 @@ class DecoratorEvaluationArtifacts:
     preferred_result: DecoratorRunResult
 
 
-class SurrogateDecorator:
-    """Adaptive runtime wrapper with warmup, probing, and cooldown-based fallback."""
+class DecoratorEvaluationRunner:
+    """Experiment runner kept separate from the runtime decorator."""
 
     def __init__(
         self,
+        *,
+        provider: SurrogateDecorator,
         simulator: HighFidelitySimulationAdapter,
         surrogate: SurrogateModelAdapter,
-        controller: HybridController,
-        rolling_window: int,
-        warmup_steps: int,
-        enable_online_recalibration: bool = False,
-        recalibration_min_samples: int = 8,
-        recalibration_interval_steps: int = 12,
-        recalibration_max_samples: int = 256,
-        recalibration_ridge: float = 1e-4,
+        calibration_error: float,
     ) -> None:
+        self.provider = provider
         self.simulator = simulator
         self.surrogate = surrogate
-        self.controller = controller
-        self.rolling_window = rolling_window
-        self.warmup_steps = warmup_steps
-        self.enable_online_recalibration = enable_online_recalibration
-        self.recalibration_min_samples = recalibration_min_samples
-        self.recalibration_interval_steps = recalibration_interval_steps
-        self.recalibration_max_samples = recalibration_max_samples
-        self.recalibration_ridge = recalibration_ridge
+        self.calibration_error = calibration_error
 
     def run(
         self,
+        *,
         model_name: str,
         threshold_multiplier: float,
     ) -> DecoratorRunResult:
-        tracker = RollingErrorTracker(window_size=self.rolling_window)
-        recalibration_manager = (
-            OnlineRecalibrationManager(
-                min_samples=self.recalibration_min_samples,
-                update_interval_steps=self.recalibration_interval_steps,
-                max_samples=self.recalibration_max_samples,
-                ridge=self.recalibration_ridge,
-            )
-            if self.enable_online_recalibration
-            else None
-        )
+        self.provider.reset()
         rows: list[dict[str, float | int | str | bool]] = []
-        selected_path_previous: str | None = None
-        controller_mode = "simulation"
-        cooldown_remaining = 0
+        effective_outputs: list[np.ndarray] = []
+        executed_surrogate_outputs: list[np.ndarray] = []
+        executed_surrogate_targets: list[np.ndarray] = []
+        effective_step_errors: list[float] = []
+        observed_errors: list[float] = []
         surrogate_steps = 0
         simulation_steps = 0
         probe_steps = 0
         observed_steps = 0
-        switch_count = 0
         effective_runtime_ms = 0.0
-        effective_step_errors: list[float] = []
-        base_surrogate_step_errors: list[float] = []
-        surrogate_step_errors: list[float] = []
-        observed_errors: list[float] = []
-        base_surrogate_outputs: list[np.ndarray] = []
-        managed_surrogate_outputs: list[np.ndarray] = []
-        effective_outputs: list[np.ndarray] = []
 
-        total_steps = len(self.surrogate.y_pred)
+        total_steps = len(self.simulator)
         for index in range(total_steps):
-            base_surrogate_prediction, surrogate_runtime_ms = self.surrogate.forecast(index)
-            true_value, simulation_runtime_ms = self.simulator.forecast(index)
-            surrogate_prediction = (
-                recalibration_manager.transform(base_surrogate_prediction)
-                if recalibration_manager is not None
-                else base_surrogate_prediction
-            )
-            base_surrogate_error = float(np.mean(np.abs(base_surrogate_prediction - true_value)))
-            surrogate_error = float(np.mean(np.abs(surrogate_prediction - true_value)))
-            base_surrogate_step_errors.append(base_surrogate_error)
-            surrogate_step_errors.append(surrogate_error)
-            base_surrogate_outputs.append(np.asarray(base_surrogate_prediction, dtype=np.float32).copy())
-            managed_surrogate_outputs.append(np.asarray(surrogate_prediction, dtype=np.float32).copy())
+            result = self.provider.forecast(index)
+            true_value = self.simulator.value_at(index)
+            pure_surrogate_value = self.surrogate.value_at(index)
+            metadata = result.metadata
 
-            rolling_error_before = tracker.mean_error
-            steps_since_last_observation = tracker.steps_since_last_observation(index)
-            probe_executed = False
-            observed_error = float("nan")
-            cooldown_before = cooldown_remaining
-            recalibration_updated = False
-
-            if index < self.warmup_steps:
-                selected_path = "simulation"
-                reason = "warmup_probe"
-                probe_executed = True
-                observed_error = surrogate_error
-                rolling_error_after = tracker.observe(step_index=index, error=surrogate_error)
-                observed_steps += 1
-                probe_steps += 1
-                effective_runtime_ms += simulation_runtime_ms + surrogate_runtime_ms
-                controller_mode = self.controller.decide(rolling_error_after, current_mode="simulation")
-            elif controller_mode == "surrogate":
-                if self.controller.should_probe(
-                    current_mode=controller_mode,
-                    steps_since_last_observation=steps_since_last_observation,
-                    cooldown_remaining=cooldown_remaining,
-                ):
-                    probe_executed = True
-                    observed_error = surrogate_error
-                    rolling_error_after = tracker.observe(step_index=index, error=surrogate_error)
-                    observed_steps += 1
-                    probe_steps += 1
-                    effective_runtime_ms += simulation_runtime_ms + surrogate_runtime_ms
-                    if self.controller.should_fallback_to_simulation(rolling_error_after):
-                        selected_path = "simulation"
-                        reason = "validation_probe_fallback"
-                        controller_mode = "simulation"
-                        cooldown_remaining = self.controller.simulation_cooldown_steps
-                    else:
-                        selected_path = "surrogate"
-                        reason = "validation_probe_keep"
-                else:
-                    selected_path = "surrogate"
-                    reason = "trusted_surrogate"
-                    rolling_error_after = rolling_error_before
-                    effective_runtime_ms += surrogate_runtime_ms
+            effective_error = _mean_absolute_error(result.value, true_value)
+            base_surrogate_error = _mean_absolute_error(pure_surrogate_value, true_value)
+            executed_surrogate_prediction = metadata.get("surrogate_prediction")
+            if executed_surrogate_prediction is not None:
+                surrogate_step_error = _mean_absolute_error(
+                    np.asarray(executed_surrogate_prediction, dtype=np.float32),
+                    true_value,
+                )
+                executed_surrogate_outputs.append(
+                    np.asarray(executed_surrogate_prediction, dtype=np.float32).copy()
+                )
+                executed_surrogate_targets.append(true_value.copy())
             else:
-                if cooldown_remaining > 0:
-                    selected_path = "simulation"
-                    reason = "simulation_cooldown"
-                    rolling_error_after = rolling_error_before
-                    effective_runtime_ms += simulation_runtime_ms
-                    cooldown_remaining -= 1
-                elif self.controller.should_probe(
-                    current_mode=controller_mode,
-                    steps_since_last_observation=steps_since_last_observation,
-                    cooldown_remaining=cooldown_remaining,
-                ):
-                    probe_executed = True
-                    observed_error = surrogate_error
-                    rolling_error_after = tracker.observe(step_index=index, error=surrogate_error)
-                    observed_steps += 1
-                    probe_steps += 1
-                    effective_runtime_ms += simulation_runtime_ms + surrogate_runtime_ms
-                    if self.controller.should_enter_surrogate(rolling_error_after):
-                        selected_path = "surrogate"
-                        reason = "reentry_probe_accept"
-                        controller_mode = "surrogate"
-                    else:
-                        selected_path = "simulation"
-                        reason = "reentry_probe_reject"
-                else:
-                    selected_path = "simulation"
-                    reason = "simulation_hold"
-                    rolling_error_after = rolling_error_before
-                    effective_runtime_ms += simulation_runtime_ms
+                surrogate_step_error = float("nan")
 
-            if selected_path == "surrogate":
-                output = surrogate_prediction
+            effective_runtime_ms += result.runtime_ms
+            effective_step_errors.append(effective_error)
+            effective_outputs.append(np.asarray(result.value, dtype=np.float32).copy())
+
+            if result.source == "surrogate":
                 surrogate_steps += 1
             else:
-                output = true_value
                 simulation_steps += 1
 
-            if recalibration_manager is not None and (probe_executed or selected_path == "simulation"):
-                recalibration_updated = recalibration_manager.observe(
-                    step_index=index,
-                    base_prediction=base_surrogate_prediction,
-                    target=true_value,
-                )
-
-            if selected_path_previous is not None and selected_path_previous != selected_path:
-                switch_count += 1
-            selected_path_previous = selected_path
-
-            effective_error = float(np.mean(np.abs(output - true_value)))
-            effective_step_errors.append(effective_error)
-            effective_outputs.append(np.asarray(output, dtype=np.float32).copy())
-            if not np.isnan(observed_error):
+            if bool(metadata["probe_executed"]):
+                probe_steps += 1
+            observed_error = float(metadata["observed_error"])
+            if np.isfinite(observed_error):
+                observed_steps += 1
                 observed_errors.append(observed_error)
 
             rows.append(
@@ -339,75 +588,86 @@ class SurrogateDecorator:
                     "index": index,
                     "timestamp": str(self.simulator.timestamps[index]),
                     "hour": float(self.simulator.hours[index]),
-                    "mode": selected_path,
-                    "controller_mode": controller_mode,
-                    "reason": reason,
-                    "probe_executed": probe_executed,
-                    "cooldown_remaining_before": float(cooldown_before),
-                    "cooldown_remaining_after": float(cooldown_remaining),
-                    "steps_since_last_observation": float(steps_since_last_observation),
-                    "entry_threshold": float(self.controller.entry_threshold),
-                    "exit_threshold": float(self.controller.exit_threshold),
-                    "threshold": float(self.controller.threshold),
-                    "rolling_error_before": rolling_error_before,
-                    "rolling_error_after": rolling_error_after,
+                    "mode": result.source,
+                    "controller_mode": str(metadata["controller_mode"]),
+                    "reason": str(metadata["reason"]),
+                    "probe_executed": bool(metadata["probe_executed"]),
+                    "simulation_executed": bool(metadata["simulation_executed"]),
+                    "surrogate_executed": bool(metadata["surrogate_executed"]),
+                    "cooldown_remaining_before": float(metadata["cooldown_remaining_before"]),
+                    "cooldown_remaining_after": float(metadata["cooldown_remaining_after"]),
+                    "steps_since_last_observation": float(
+                        metadata["steps_since_last_observation"]
+                    ),
+                    "entry_threshold": float(metadata["entry_threshold"]),
+                    "exit_threshold": float(metadata["exit_threshold"]),
+                    "threshold": float(metadata["threshold"]),
+                    "rolling_error_before": float(metadata["rolling_error_before"]),
+                    "rolling_error_after": float(metadata["rolling_error_after"]),
                     "observed_error": observed_error,
                     "base_surrogate_step_error": base_surrogate_error,
-                    "surrogate_step_error": surrogate_error,
+                    "surrogate_step_error": surrogate_step_error,
                     "effective_step_error": effective_error,
-                    "surrogate_runtime_ms": surrogate_runtime_ms,
-                    "simulation_runtime_ms": simulation_runtime_ms,
-                    "recalibration_active": bool(
-                        recalibration_manager.is_active if recalibration_manager is not None else False
-                    ),
-                    "recalibration_updated": recalibration_updated,
-                    "recalibration_sample_count": float(
-                        recalibration_manager.sample_count if recalibration_manager is not None else 0
-                    ),
-                    "effective_runtime_ms": float(
-                        simulation_runtime_ms + surrogate_runtime_ms
-                        if probe_executed
-                        else (surrogate_runtime_ms if selected_path == "surrogate" else simulation_runtime_ms)
-                    ),
+                    "surrogate_runtime_ms": float(metadata["surrogate_runtime_ms"]),
+                    "simulation_runtime_ms": float(metadata["simulation_runtime_ms"]),
+                    "recalibration_active": bool(metadata["recalibration_active"]),
+                    "recalibration_updated": bool(metadata["recalibration_updated"]),
+                    "recalibration_sample_count": float(metadata["recalibration_sample_count"]),
+                    "effective_runtime_ms": float(result.runtime_ms),
                 }
             )
 
+        y_true = np.asarray(self.simulator.y_true, dtype=np.float32)
+        base_surrogate_array = np.asarray(self.surrogate.y_pred, dtype=np.float32)
+        effective_output_array = np.asarray(effective_outputs, dtype=np.float32)
         simulator_total_runtime_ms = float(np.sum(self.simulator.runtime_ms))
         surrogate_total_runtime_ms = float(np.sum(self.surrogate.runtime_ms))
-        y_true = np.asarray(self.simulator.y_true, dtype=np.float32)
-        base_surrogate_array = np.asarray(base_surrogate_outputs, dtype=np.float32)
-        managed_surrogate_array = np.asarray(managed_surrogate_outputs, dtype=np.float32)
-        effective_output_array = np.asarray(effective_outputs, dtype=np.float32)
         pure_surrogate_mae = mae(y_true, base_surrogate_array)
-        managed_surrogate_mae = mae(y_true, managed_surrogate_array)
+
+        if executed_surrogate_outputs:
+            managed_surrogate_array = np.asarray(executed_surrogate_outputs, dtype=np.float32)
+            managed_surrogate_targets = np.asarray(executed_surrogate_targets, dtype=np.float32)
+            managed_surrogate_mae = mae(managed_surrogate_targets, managed_surrogate_array)
+            managed_surrogate_mape = mape(managed_surrogate_targets, managed_surrogate_array)
+            managed_surrogate_smape = smape(managed_surrogate_targets, managed_surrogate_array)
+            managed_surrogate_nmae = nmae(managed_surrogate_targets, managed_surrogate_array)
+            managed_surrogate_nrmse = nrmse(managed_surrogate_targets, managed_surrogate_array)
+        else:
+            managed_surrogate_mae = float("nan")
+            managed_surrogate_mape = float("nan")
+            managed_surrogate_smape = float("nan")
+            managed_surrogate_nmae = float("nan")
+            managed_surrogate_nrmse = float("nan")
+
         decorator_mae = mae(y_true, effective_output_array)
         metrics = {
             "threshold_multiplier": float(threshold_multiplier),
+            "calibration_mae": float(self.calibration_error),
             "pure_surrogate_mae": pure_surrogate_mae,
             "pure_surrogate_mape": mape(y_true, base_surrogate_array),
             "pure_surrogate_smape": smape(y_true, base_surrogate_array),
             "pure_surrogate_nmae": nmae(y_true, base_surrogate_array),
             "pure_surrogate_nrmse": nrmse(y_true, base_surrogate_array),
             "managed_surrogate_mae": managed_surrogate_mae,
-            "managed_surrogate_mape": mape(y_true, managed_surrogate_array),
-            "managed_surrogate_smape": smape(y_true, managed_surrogate_array),
-            "managed_surrogate_nmae": nmae(y_true, managed_surrogate_array),
-            "managed_surrogate_nrmse": nrmse(y_true, managed_surrogate_array),
+            "managed_surrogate_mape": managed_surrogate_mape,
+            "managed_surrogate_smape": managed_surrogate_smape,
+            "managed_surrogate_nmae": managed_surrogate_nmae,
+            "managed_surrogate_nrmse": managed_surrogate_nrmse,
+            "managed_surrogate_evaluated_steps": float(len(executed_surrogate_outputs)),
             "decorator_mae": decorator_mae,
             "decorator_rmse": rmse(y_true, effective_output_array),
             "decorator_mape": mape(y_true, effective_output_array),
             "decorator_smape": smape(y_true, effective_output_array),
             "decorator_nmae": nmae(y_true, effective_output_array),
             "decorator_nrmse": nrmse(y_true, effective_output_array),
-            "recalibration_improvement": float(pure_surrogate_mae - managed_surrogate_mae),
-            "fallback_improvement": float(managed_surrogate_mae - decorator_mae),
+            "fallback_improvement": float(pure_surrogate_mae - decorator_mae),
             "surrogate_usage_ratio": float(surrogate_steps / total_steps),
             "simulation_usage_ratio": float(simulation_steps / total_steps),
             "observation_step_ratio": float(observed_steps / total_steps),
             "probe_step_ratio": float(probe_steps / total_steps),
-            "switch_count": float(switch_count),
+            "switch_count": float(self.provider.switch_count),
             "avg_observed_error": float(np.mean(observed_errors)) if observed_errors else float("nan"),
-            "avg_observed_rolling_error": tracker.mean_error,
+            "avg_observed_rolling_error": self.provider.tracker.mean_error,
             "decorator_runtime_ms": float(effective_runtime_ms),
             "simulator_runtime_ms": simulator_total_runtime_ms,
             "pure_surrogate_runtime_ms": surrogate_total_runtime_ms,
@@ -415,20 +675,16 @@ class SurrogateDecorator:
             "pure_surrogate_speedup": float(
                 simulator_total_runtime_ms / max(surrogate_total_runtime_ms, 1e-9)
             ),
-            "online_recalibration_enabled": float(bool(recalibration_manager is not None)),
-            "recalibration_active_final": float(
-                recalibration_manager.is_active if recalibration_manager is not None else False
+            "online_recalibration_enabled": float(
+                isinstance(self.provider.surrogate, RecalibratingForecastDecorator)
             ),
-            "recalibration_updates": float(
-                recalibration_manager.update_count if recalibration_manager is not None else 0
-            ),
-            "recalibration_sample_count": float(
-                recalibration_manager.sample_count if recalibration_manager is not None else 0
-            ),
+            "recalibration_active_final": float(self.provider._recalibration_active),
+            "recalibration_updates": float(self.provider._recalibration_updates),
+            "recalibration_sample_count": float(self.provider._recalibration_sample_count),
         }
         return DecoratorRunResult(
             model_name=model_name,
-            threshold=float(self.controller.threshold),
+            threshold=float(self.provider.controller.threshold),
             threshold_multiplier=float(threshold_multiplier),
             metrics=metrics,
             trace=pd.DataFrame(rows),
@@ -437,10 +693,25 @@ class SurrogateDecorator:
 
 def evaluate_decorator_thresholds(
     artifacts: ModelArtifacts,
+    calibration_split: DatasetSplit,
     test_split: DatasetSplit,
     normalization: NormalizationStats,
     config: ExperimentConfig,
 ) -> DecoratorEvaluationArtifacts:
+    y_calibration = _denormalize(calibration_split.y, normalization)
+    calibration_predictions = _collect_surrogate_predictions(
+        artifacts=artifacts,
+        X=calibration_split.X,
+        normalization=normalization,
+        device=config.training.device,
+        batch_size=config.training.batch_size,
+    )
+    calibration_mae = mae(y_calibration, calibration_predictions)
+    thresholds = _build_threshold_schedule(
+        base_error=calibration_mae,
+        multipliers=config.decorator.threshold_multipliers,
+    )
+
     y_true = _denormalize(test_split.y, normalization)
     surrogate_predictions, surrogate_runtimes = _collect_streaming_surrogate_outputs(
         artifacts=artifacts,
@@ -450,13 +721,6 @@ def evaluate_decorator_thresholds(
         batch_size=config.training.batch_size,
         config=config,
     )
-
-    pure_surrogate_mae = mae(y_true, surrogate_predictions)
-    thresholds = _build_threshold_schedule(
-        base_error=pure_surrogate_mae,
-        multipliers=config.decorator.threshold_multipliers,
-    )
-
     simulator_adapter = HighFidelitySimulationAdapter(
         y_true=y_true,
         runtime_ms=test_split.reference_runtime_ms,
@@ -470,26 +734,38 @@ def evaluate_decorator_thresholds(
 
     results: list[DecoratorRunResult] = []
     for multiplier, threshold in thresholds:
+        runtime_surrogate: ForecastProvider = surrogate_adapter
+        if config.decorator.enable_online_recalibration:
+            runtime_surrogate = RecalibratingForecastDecorator(
+                runtime_surrogate,
+                min_samples=config.decorator.recalibration_min_samples,
+                update_interval_steps=config.decorator.recalibration_interval_steps,
+                max_samples=config.decorator.recalibration_max_samples,
+                ridge=config.decorator.recalibration_ridge,
+            )
+
         decorator = SurrogateDecorator(
+            surrogate=runtime_surrogate,
             simulator=simulator_adapter,
-            surrogate=surrogate_adapter,
             controller=HybridController(
                 threshold=threshold,
                 hysteresis_ratio=config.decorator.hysteresis_ratio,
                 validation_interval_steps=config.decorator.validation_interval_steps,
+                max_validation_interval_steps=config.decorator.max_validation_interval_steps,
                 simulation_cooldown_steps=config.decorator.simulation_cooldown_steps,
                 reentry_probe_interval_steps=config.decorator.reentry_probe_interval_steps,
             ),
             rolling_window=config.decorator.rolling_window,
             warmup_steps=config.decorator.warmup_steps,
-            enable_online_recalibration=config.decorator.enable_online_recalibration,
-            recalibration_min_samples=config.decorator.recalibration_min_samples,
-            recalibration_interval_steps=config.decorator.recalibration_interval_steps,
-            recalibration_max_samples=config.decorator.recalibration_max_samples,
-            recalibration_ridge=config.decorator.recalibration_ridge,
+        )
+        runner = DecoratorEvaluationRunner(
+            provider=decorator,
+            simulator=simulator_adapter,
+            surrogate=surrogate_adapter,
+            calibration_error=calibration_mae,
         )
         results.append(
-            decorator.run(
+            runner.run(
                 model_name=artifacts.name,
                 threshold_multiplier=multiplier,
             )
@@ -509,6 +785,22 @@ def evaluate_decorator_thresholds(
     )
 
 
+def _collect_surrogate_predictions(
+    artifacts: ModelArtifacts,
+    X: np.ndarray,
+    normalization: NormalizationStats,
+    device: str,
+    batch_size: int,
+) -> np.ndarray:
+    predictions_norm = predict_model(
+        artifacts=artifacts,
+        X=X,
+        device=device,
+        batch_size=batch_size,
+    )
+    return _denormalize(np.asarray(predictions_norm, dtype=np.float32), normalization)
+
+
 def _collect_streaming_surrogate_outputs(
     artifacts: ModelArtifacts,
     X: np.ndarray,
@@ -517,9 +809,10 @@ def _collect_streaming_surrogate_outputs(
     batch_size: int,
     config: ExperimentConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    predictions_norm = predict_model(
+    predictions = _collect_surrogate_predictions(
         artifacts=artifacts,
         X=X,
+        normalization=normalization,
         device=device,
         batch_size=batch_size,
     )
@@ -531,9 +824,8 @@ def _collect_streaming_surrogate_outputs(
         warmup_calls=config.decorator.streaming_warmup_calls,
         enable_jit_optimization=config.decorator.enable_jit_streaming_optimization,
     )
-    predictions_array = np.asarray(predictions_norm, dtype=np.float32)
-    runtimes_ms = np.full(len(predictions_array), streaming_latency_ms, dtype=np.float32)
-    return _denormalize(predictions_array, normalization), runtimes_ms
+    runtimes_ms = np.full(len(predictions), streaming_latency_ms, dtype=np.float32)
+    return predictions, runtimes_ms
 
 
 def _measure_streaming_step_latency_ms(
@@ -629,3 +921,7 @@ def _build_threshold_schedule(
 
 def _denormalize(values: np.ndarray, normalization: NormalizationStats) -> np.ndarray:
     return values * normalization.target_std + normalization.target_mean
+
+
+def _mean_absolute_error(left: np.ndarray, right: np.ndarray) -> float:
+    return float(np.mean(np.abs(np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32))))

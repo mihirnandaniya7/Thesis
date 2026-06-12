@@ -1,3 +1,5 @@
+"""Dataset construction, chronological splitting, and normalization utilities."""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +14,8 @@ from surrogate_thesis.config import DatasetConfig
 
 @dataclass(slots=True)
 class WindowedDataset:
+    """Sliding-window samples before train/validation/test splitting."""
+
     X: np.ndarray
     y: np.ndarray
     target_timestamps: np.ndarray
@@ -22,7 +26,24 @@ class WindowedDataset:
 
 
 @dataclass(slots=True)
+class ComponentTransitionDataset:
+    """Samples for component surrogates in state-transition form."""
+
+    state: np.ndarray
+    parameters: np.ndarray
+    action: np.ndarray
+    delta_t: np.ndarray
+    next_state: np.ndarray
+    state_columns: list[str]
+    parameter_keys: list[str]
+    action_columns: list[str]
+    next_state_columns: list[str]
+
+
+@dataclass(slots=True)
 class DatasetSplit:
+    """One chronological split used for training, validation, or testing."""
+
     X: np.ndarray
     y: np.ndarray
     target_timestamps: np.ndarray
@@ -32,12 +53,16 @@ class DatasetSplit:
 
 @dataclass(slots=True)
 class NormalizationStats:
+    """Feature and target statistics fitted only on the training split."""
+
     feature_mean: np.ndarray
     feature_std: np.ndarray
     target_mean: np.ndarray
     target_std: np.ndarray
 
     def to_dict(self) -> dict[str, list[float]]:
+        """Serialize normalization arrays for experiment artifacts."""
+
         return {
             "feature_mean": self.feature_mean.tolist(),
             "feature_std": self.feature_std.tolist(),
@@ -48,6 +73,8 @@ class NormalizationStats:
 
 @dataclass(slots=True)
 class PreparedDataset:
+    """Full dataset bundle consumed by training, evaluation, and plotting."""
+
     raw_frame: pd.DataFrame
     feature_columns: list[str]
     target_column: str
@@ -58,6 +85,8 @@ class PreparedDataset:
 
 
 def add_time_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add cyclical hour features and a weekend flag to the simulator frame."""
+
     enriched = frame.copy()
     timestamps = pd.to_datetime(enriched["timestamp"])
     hour_of_day = timestamps.dt.hour + timestamps.dt.minute / 60
@@ -68,6 +97,8 @@ def add_time_features(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_windows(frame: pd.DataFrame, config: DatasetConfig) -> WindowedDataset:
+    """Convert a chronological frame into lookback/horizon supervised windows."""
+
     feature_values = frame[config.feature_columns].to_numpy(dtype=np.float32)
     target_values = frame[config.target_column].to_numpy(dtype=np.float32)
     timestamps = pd.to_datetime(frame["timestamp"]).to_numpy()
@@ -81,6 +112,8 @@ def build_windows(frame: pd.DataFrame, config: DatasetConfig) -> WindowedDataset
     for start in range(max_start):
         window_end = start + config.lookback
         target_end = window_end + config.horizon
+        # The input window ends before the forecast target horizon starts, so
+        # each sample follows the same short-term forecasting setup.
         X.append(feature_values[start:window_end])
         y.append(target_values[window_end:target_end])
         target_index = target_end - 1
@@ -99,7 +132,50 @@ def build_windows(frame: pd.DataFrame, config: DatasetConfig) -> WindowedDataset
     )
 
 
+def build_component_transitions(
+    frame: pd.DataFrame,
+    *,
+    state_columns: list[str],
+    parameter_values: dict[str, float],
+    action_columns: list[str],
+    delta_t_hours: float,
+    next_state_columns: list[str] | None = None,
+) -> ComponentTransitionDataset:
+    """Build supervised samples for component transitions.
+
+    Each row represents the agreed component form:
+    state + parameters + action --delta_t--> next_state.
+    """
+
+    if len(frame) < 2:
+        raise ValueError("At least two rows are required to build component transitions.")
+
+    resolved_next_state_columns = (
+        list(next_state_columns) if next_state_columns is not None else list(state_columns)
+    )
+    parameter_keys = list(parameter_values.keys())
+    parameter_row = np.asarray(
+        [parameter_values[key] for key in parameter_keys],
+        dtype=np.float32,
+    )
+    sample_count = len(frame) - 1
+
+    return ComponentTransitionDataset(
+        state=frame[state_columns].iloc[:-1].to_numpy(dtype=np.float32),
+        parameters=np.repeat(parameter_row[None, :], sample_count, axis=0),
+        action=frame[action_columns].iloc[:-1].to_numpy(dtype=np.float32),
+        delta_t=np.full((sample_count, 1), float(delta_t_hours), dtype=np.float32),
+        next_state=frame[resolved_next_state_columns].iloc[1:].to_numpy(dtype=np.float32),
+        state_columns=list(state_columns),
+        parameter_keys=parameter_keys,
+        action_columns=list(action_columns),
+        next_state_columns=resolved_next_state_columns,
+    )
+
+
 def prepare_dataset(frame: pd.DataFrame, config: DatasetConfig) -> PreparedDataset:
+    """Build normalized chronological train, validation, and test splits."""
+
     if not np.isclose(config.train_ratio + config.val_ratio + config.test_ratio, 1.0):
         raise ValueError("Train/validation/test ratios must sum to 1.0.")
 
@@ -114,7 +190,13 @@ def prepare_dataset(frame: pd.DataFrame, config: DatasetConfig) -> PreparedDatas
     val = _make_split(windowed, train_end, val_end)
     test = _make_split(windowed, val_end, n_samples)
 
-    normalization = _fit_normalization(train=train, feature_columns=windowed.feature_columns, target_column=windowed.target_column)
+    # Fit statistics on training data only to keep validation and test results
+    # leakage-safe.
+    normalization = _fit_normalization(
+        train=train,
+        feature_columns=windowed.feature_columns,
+        target_column=windowed.target_column,
+    )
     train = _normalize_split(train, normalization)
     val = _normalize_split(val, normalization)
     test = _normalize_split(test, normalization)
@@ -131,6 +213,8 @@ def prepare_dataset(frame: pd.DataFrame, config: DatasetConfig) -> PreparedDatas
 
 
 def save_dataset_artifacts(dataset: PreparedDataset, output_dir: str | Path) -> None:
+    """Persist raw data, normalization metadata, and compressed split arrays."""
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +228,8 @@ def save_dataset_artifacts(dataset: PreparedDataset, output_dir: str | Path) -> 
 
 
 def _make_split(windowed: WindowedDataset, start: int, end: int) -> DatasetSplit:
+    """Slice a windowed dataset without shuffling chronological order."""
+
     return DatasetSplit(
         X=windowed.X[start:end].copy(),
         y=windowed.y[start:end].copy(),
@@ -156,11 +242,15 @@ def _make_split(windowed: WindowedDataset, start: int, end: int) -> DatasetSplit
 def _fit_normalization(
     train: DatasetSplit, feature_columns: list[str], target_column: str
 ) -> NormalizationStats:
+    """Estimate normalization parameters from the training split."""
+
     feature_mean = train.X.mean(axis=(0, 1))
     feature_std = train.X.std(axis=(0, 1))
     feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
 
     if target_column in feature_columns:
+        # When the target is also a feature, use the exact same statistics so
+        # persistence and neural outputs stay on a consistent scale.
         target_index = feature_columns.index(target_column)
         target_mean = np.asarray([feature_mean[target_index]], dtype=np.float32)
         target_std = np.asarray([feature_std[target_index]], dtype=np.float32)
@@ -178,6 +268,8 @@ def _fit_normalization(
 
 
 def _normalize_split(split: DatasetSplit, normalization: NormalizationStats) -> DatasetSplit:
+    """Apply fitted normalization statistics to one split."""
+
     X = (split.X - normalization.feature_mean) / normalization.feature_std
     y = (split.y - normalization.target_mean) / normalization.target_std
     return DatasetSplit(
@@ -190,6 +282,8 @@ def _normalize_split(split: DatasetSplit, normalization: NormalizationStats) -> 
 
 
 def _save_split(split: DatasetSplit, path: Path) -> None:
+    """Write one split to an npz file for reproducible inspection."""
+
     np.savez_compressed(
         path,
         X=split.X,
@@ -198,4 +292,3 @@ def _save_split(split: DatasetSplit, path: Path) -> None:
         target_hours=split.target_hours,
         reference_runtime_ms=split.reference_runtime_ms,
     )
-

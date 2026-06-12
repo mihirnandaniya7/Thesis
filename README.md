@@ -1,16 +1,17 @@
 # Surrogate Modeling Based on Machine Learning Approaches for Hospitals as Microgrids
 
-This repository implements a surrogate-integrated simulation prototype for short-term microgrid forecasting. The current version combines a trusted reference simulator, multiple surrogate models, and a real decorator-based runtime layer with probe-based trust estimation and lightweight online recalibration.
+This repository implements a surrogate-integrated simulation prototype for short-term microgrid forecasting. The current version combines a trusted reference simulator, explicit component transition functions, multiple surrogate models, and decorator-based runtime switching with probe-based trust estimation and lightweight online recalibration.
 
 The implemented workflow is:
 
 1. Define the reference simulator.
-2. Generate synthetic trajectories.
-3. Construct supervised windows.
-4. Train surrogate candidates.
-5. Evaluate fidelity and runtime.
-6. Integrate the surrogate through decorator-managed runtime switching.
-7. Recalibrate the surrogate online from trusted high-fidelity labels.
+2. Expose simulator behavior through component transitions.
+3. Generate synthetic trajectories.
+4. Construct supervised windows and component transition samples.
+5. Train surrogate candidates.
+6. Evaluate fidelity and runtime.
+7. Integrate the surrogate through decorator-managed runtime switching.
+8. Recalibrate the surrogate online from trusted high-fidelity labels.
 
 ## Structure
 
@@ -29,11 +30,12 @@ For code review, the most important files are:
 - `docs/problem_statement.md`: current thesis framing, methodology, and notation
 - `scripts/run_pipeline.py`: command-line entry point
 - `surrogate_thesis/pipeline.py`: end-to-end experiment orchestration
-- `surrogate_thesis/simulation/reference_simulator.py`: trusted reference simulator
+- `surrogate_thesis/simulation/component_interface.py`: common component contract
+- `surrogate_thesis/simulation/reference_simulator.py`: trusted reference simulator and explicit load/PV/battery component functions
 - `surrogate_thesis/data/dataset.py`: window construction and normalization
 - `surrogate_thesis/training/trainer.py`: offline model training
 - `surrogate_thesis/controller/hybrid_controller.py`: switching policy
-- `surrogate_thesis/controller/surrogate_decorator.py`: common forecast interface, runtime decorators, probing, fallback, recalibration, and evaluation runner
+- `surrogate_thesis/controller/surrogate_decorator.py`: component decorator, forecast adapter layer, probing, fallback, recalibration, and evaluation runner
 - `tests/test_decorator.py`: focused decorator tests
 
 ## Quick Start
@@ -94,6 +96,28 @@ Each experiment writes:
 - lookback: `32`
 - horizon: `1`
 
+## Component Transition Contract
+
+The thesis-facing simulator interface is the component transition:
+
+```text
+f(state, parameters, action) --delta_t--> next_state
+```
+
+In code, `delta_t` is passed as an argument so the simulator component and the surrogate component can use the same callable signature:
+
+```python
+next_state = component_step(state, parameters, action, delta_t)
+```
+
+The dictionaries separate the information needed by a model:
+
+- `state`: dynamic model variables, for example battery state-of-charge, previous load, cloud state, or inertia state
+- `parameters`: static configuration, for example battery capacity, PV peak power, efficiencies, or load-profile constants
+- `action`: external inputs, disturbances, or control values, for example `load_kw`, `pv_kw`, timestamp context, or stochastic disturbance samples
+
+The reference simulator now exposes this form for load, PV, and battery behavior through explicit component functions. The object-oriented simulator still exists for end-to-end trajectory generation, but its internal methods delegate to these state-explicit functions.
+
 ## Runtime Evaluation
 
 The evaluation now reports:
@@ -107,7 +131,14 @@ The evaluation now reports:
 
 ## Decorator Runtime Supervision
 
-The runtime architecture uses a common `ForecastProvider.forecast(index)` interface. The high-fidelity simulator adapter, surrogate adapter, recalibration decorator, and trust-managed surrogate decorator all expose this same interface, so the decorated provider can be used as a transparent replacement by the evaluation loop.
+The runtime architecture has two related layers:
+
+- component layer: `state + parameters + action --delta_t--> next_state`
+- evaluation adapter layer: `ForecastProvider.forecast(index)` for replaying prepared validation/test arrays during offline experiments
+
+The component layer is the target architecture for simulator replacement. A trusted simulator component and a surrogate component can be wrapped by `ComponentSurrogateDecorator`, which compares their returned state dictionaries on probe steps and switches between them according to the hybrid controller.
+
+The `forecast(index)` layer is kept for the existing experiment pipeline. It lets the evaluation runner compare trained models against prepared test data without changing all current result-generation scripts. It should be understood as an offline adapter layer, not as the final component API.
 
 The decorator layer supports:
 

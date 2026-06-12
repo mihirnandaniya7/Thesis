@@ -1,3 +1,5 @@
+"""End-to-end experiment pipeline for simulator, models, metrics, and artifacts."""
+
 from __future__ import annotations
 
 import json
@@ -28,6 +30,8 @@ from surrogate_thesis.training import fit_model
 
 
 def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = None) -> dict[str, Any]:
+    """Run one complete thesis experiment and return a summary dictionary."""
+
     resolved_output = _resolve_output_dir(config.run_name, output_dir)
     data_dir = resolved_output / "data"
     models_dir = resolved_output / "models"
@@ -39,6 +43,8 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
     _set_global_seeds(config.seed)
     config.save(resolved_output / "resolved_config.json")
 
+    # The simulator is the trusted data-generating system; all surrogate models
+    # learn from windows built from this chronological reference frame.
     simulator = ReferenceSimulator()
     raw_frame = simulator.generate_series(config.simulator, seed=config.seed)
     dataset = prepare_dataset(raw_frame, config.dataset)
@@ -50,6 +56,8 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
     model_artifacts = {}
 
     for model_name in config.model_names:
+        # Each model is trained/evaluated through the same interface so metrics
+        # remain directly comparable across baselines and neural surrogates.
         artifacts = fit_model(
             model_name=model_name,
             train_split=dataset.train,
@@ -69,6 +77,8 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
         results_by_name[result.model_name] = result
         prediction_columns[model_name] = result.predictions
 
+    # Metrics and predictions are saved as CSV files because they are used both
+    # for thesis tables and for follow-up evidence checks.
     metrics_frame = pd.DataFrame([result.to_record() for result in evaluation_results]).sort_values(
         by="MAE"
     )
@@ -112,6 +122,8 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
     best_model_row = metrics_frame.iloc[0]
     decorator_summary_records = []
     if config.decorator.enabled:
+        # Decorator evaluation is limited to configured learned candidates, not
+        # necessarily every baseline in model_names.
         candidate_names = [
             model_name
             for model_name in config.decorator.candidate_model_names
@@ -144,7 +156,9 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
                     "model_name": model_name,
                     **decorator_artifacts.preferred_result.metrics,
                     "preferred_threshold": decorator_artifacts.preferred_result.threshold,
-                    "preferred_threshold_multiplier": decorator_artifacts.preferred_result.threshold_multiplier,
+                    "preferred_threshold_multiplier": (
+                        decorator_artifacts.preferred_result.threshold_multiplier
+                    ),
                     "sensitivity_csv": str(sensitivity_path.relative_to(resolved_output)),
                     "trace_csv": str(trace_path.relative_to(resolved_output)),
                 }
@@ -153,6 +167,7 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
             pd.DataFrame(decorator_summary_records).sort_values(
                 by="decorator_mae"
             ).to_csv(decorator_dir / "decorator_summary.csv", index=False)
+
     summary = {
         "run_name": config.run_name,
         "output_dir": str(resolved_output),
@@ -166,12 +181,16 @@ def run_experiment(config: ExperimentConfig, output_dir: str | Path | None = Non
 
 
 def _set_global_seeds(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch for reproducible experiment runs."""
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def _resolve_output_dir(run_name: str, output_dir: str | Path | None) -> Path:
+    """Return the requested output directory or a timestamped artifacts path."""
+
     if output_dir is not None:
         return Path(output_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

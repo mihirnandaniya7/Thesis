@@ -6,6 +6,7 @@ import numpy as np
 
 from surrogate_thesis.controller.hybrid_controller import HybridController
 from surrogate_thesis.controller.surrogate_decorator import (
+    ComponentSurrogateDecorator,
     DecoratorEvaluationRunner,
     HighFidelitySimulationAdapter,
     RecalibratingForecastDecorator,
@@ -82,6 +83,47 @@ def _run_decorator(
 
 
 class DecoratorTests(unittest.TestCase):
+    def test_component_decorator_switches_real_component_to_surrogate(self) -> None:
+        def simulator_step(state, parameters, action, delta_t):
+            return {"x": state["x"] + action["u"] * delta_t}
+
+        def surrogate_step(state, parameters, action, delta_t):
+            return {"x": state["x"] + action["u"] * delta_t + 0.01}
+
+        decorator = ComponentSurrogateDecorator(
+            simulator=simulator_step,
+            surrogate=surrogate_step,
+            controller=HybridController(
+                threshold=0.05,
+                validation_interval_steps=2,
+                simulation_cooldown_steps=1,
+                reentry_probe_interval_steps=1,
+            ),
+            rolling_window=2,
+            warmup_steps=1,
+            error_keys=["x"],
+            component_name="unit_component",
+        )
+
+        state = {"x": 0.0}
+        sources = []
+        reasons = []
+        for _ in range(5):
+            result = decorator.step(
+                state=state,
+                parameters={},
+                action={"u": 1.0},
+                delta_t=1.0,
+            )
+            state = result.state
+            sources.append(result.source)
+            reasons.append(result.metadata["reason"])
+
+        self.assertEqual(sources[0], "simulation")
+        self.assertIn("surrogate", sources)
+        self.assertIn("trusted_surrogate", reasons)
+        self.assertEqual(result.metadata["component_name"], "unit_component")
+
     def test_decorator_managed_recalibration_uses_trusted_labels_to_improve_surrogate(self) -> None:
         y_true = np.array(
             [[1.0], [1.4], [1.8], [2.2], [2.6], [3.0], [3.4], [3.8]],

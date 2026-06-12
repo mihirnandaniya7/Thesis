@@ -1,3 +1,5 @@
+"""Training and inference helpers for baseline and neural surrogate models."""
+
 from __future__ import annotations
 
 import copy
@@ -25,6 +27,8 @@ from surrogate_thesis.models import (
 
 @dataclass(slots=True)
 class ModelArtifacts:
+    """Trained model plus saved checkpoint and training metadata."""
+
     name: str
     model: Any
     checkpoint_path: Path
@@ -39,12 +43,16 @@ def fit_model(
     config: ExperimentConfig,
     output_dir: str | Path,
 ) -> ModelArtifacts:
+    """Fit one configured model and persist its checkpoint artifacts."""
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     input_dim = train_split.X.shape[-1]
     horizon = train_split.y.shape[-1]
 
     if model_name == "persistence":
+        # Persistence has no trainable weights, but it is saved like other
+        # baselines so the artifact layout stays uniform.
         target_index = config.dataset.feature_columns.index(config.dataset.target_column)
         model = PersistenceBaseline(
             target_feature_index=target_index,
@@ -55,6 +63,8 @@ def fit_model(
         return ModelArtifacts(name=model_name, model=model, checkpoint_path=checkpoint)
 
     if model_name == "linear_regression":
+        # Linear regression is a fast classical baseline on the flattened input
+        # window, useful for judging whether neural models add value.
         model = LinearRegressionBaseline().fit(train_split.X, train_split.y)
         checkpoint = output_path / f"{model_name}.pkl"
         checkpoint.write_bytes(pickle.dumps(model))
@@ -91,6 +101,8 @@ def predict_model(
     device: str = "cpu",
     batch_size: int = 256,
 ) -> np.ndarray:
+    """Run inference for either sklearn-style baselines or PyTorch models."""
+
     if hasattr(artifacts.model, "predict"):
         return np.asarray(artifacts.model.predict(X), dtype=np.float32)
 
@@ -115,6 +127,8 @@ def _build_torch_model(
     horizon: int,
     config: ExperimentConfig,
 ) -> nn.Module:
+    """Construct the requested neural surrogate architecture."""
+
     model_config = config.model
     if model_name == "lstm":
         return LSTMRegressor(
@@ -144,6 +158,8 @@ def _train_torch_model(
     checkpoint_path: Path,
     config: ExperimentConfig,
 ) -> tuple[dict[str, list[float]], float]:
+    """Train a PyTorch model with validation-based early stopping."""
+
     device = torch.device(config.training.device)
     model.to(device)
 
@@ -181,6 +197,8 @@ def _train_torch_model(
     start = perf_counter()
 
     for _ in range(config.training.max_epochs):
+        # Training loss is averaged by example count so the last short batch has
+        # the correct weight in the epoch summary.
         model.train()
         train_loss_total = 0.0
         train_examples = 0
@@ -216,6 +234,8 @@ def _train_torch_model(
         history["train_loss"].append(epoch_train_loss)
         history["val_loss"].append(epoch_val_loss)
 
+        # Keep the best validation checkpoint and stop after patience epochs
+        # without meaningful improvement.
         if epoch_val_loss < best_val_loss - 1e-8:
             best_val_loss = epoch_val_loss
             best_state = copy.deepcopy(model.state_dict())

@@ -1,3 +1,5 @@
+"""Command-line entry point for running the thesis experiment pipeline."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
+    # Allow the script to be executed directly from any working directory while
+    # still importing the local surrogate_thesis package.
     sys.path.insert(0, str(ROOT))
 
 from surrogate_thesis.config import ExperimentConfig
@@ -13,6 +17,8 @@ from surrogate_thesis.pipeline import run_experiment
 
 
 def main() -> None:
+    """Parse CLI arguments, run the experiment, and print a short summary."""
+
     parser = argparse.ArgumentParser(description="Run the surrogate thesis experiment pipeline.")
     parser.add_argument(
         "--config",

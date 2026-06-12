@@ -1,3 +1,5 @@
+"""Plotting helpers for experiment and decorator artifacts."""
+
 from __future__ import annotations
 
 import os
@@ -21,6 +23,8 @@ def plot_prediction_overview(
     output_path: str | Path,
     points: int,
 ) -> None:
+    """Plot recent ground-truth and model predictions from the test split."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,23 +48,43 @@ def plot_residual_overview(
     predictions_by_model: dict[str, np.ndarray],
     output_path: str | Path,
 ) -> None:
+    """Plot residual distributions with shared axes for fair comparison."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    residuals_by_model = {
+        name: y_true[:, 0] - predictions[:, 0]
+        for name, predictions in predictions_by_model.items()
+    }
+    all_residuals = np.concatenate(list(residuals_by_model.values()))
+    max_abs_residual = float(np.max(np.abs(all_residuals)))
+    # Symmetric bins around zero make bias and spread comparable across models.
+    x_limit = max(max_abs_residual * 1.05, 1e-6)
+    bins = np.linspace(-x_limit, x_limit, 41)
+    density_max = max(
+        float(np.max(np.histogram(residuals, bins=bins, density=True)[0]))
+        for residuals in residuals_by_model.values()
+    )
+
     n_models = len(predictions_by_model)
     fig, axes = plt.subplots(n_models, 1, figsize=(10, 3.5 * n_models), squeeze=False)
-    for axis, (name, predictions) in zip(axes[:, 0], predictions_by_model.items(), strict=False):
-        residuals = y_true[:, 0] - predictions[:, 0]
-        axis.hist(residuals, bins=30, color="#4472c4", alpha=0.8)
+    for axis, (name, residuals) in zip(axes[:, 0], residuals_by_model.items(), strict=False):
+        axis.hist(residuals, bins=bins, density=True, color="#4472c4", alpha=0.8)
+        axis.axvline(0.0, color="#1d1d1d", linewidth=1.2, linestyle="--")
+        axis.set_xlim(-x_limit, x_limit)
+        axis.set_ylim(0.0, density_max * 1.08)
         axis.set_title(f"Residual Distribution: {name}")
         axis.set_xlabel("Residual (kW)")
-        axis.set_ylabel("Count")
+        axis.set_ylabel("Density")
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     plt.close(fig)
 
 
 def plot_runtime_comparison(metrics_frame: pd.DataFrame, output_path: str | Path) -> None:
+    """Compare model runtime against the reference simulator runtime."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +93,8 @@ def plot_runtime_comparison(metrics_frame: pd.DataFrame, output_path: str | Path
     metric_column = (
         "full_test_runtime_ms" if "full_test_runtime_ms" in frame.columns else "latency_ms"
     )
+    # Older artifacts may only contain latency columns, so the plot falls back
+    # gracefully while newer runs use full test-set runtime.
     simulator_column = (
         "simulator_full_test_runtime_ms"
         if "simulator_full_test_runtime_ms" in frame.columns
@@ -98,6 +124,8 @@ def plot_runtime_comparison(metrics_frame: pd.DataFrame, output_path: str | Path
 
 
 def plot_normalized_error_comparison(metrics_frame: pd.DataFrame, output_path: str | Path) -> None:
+    """Plot absolute and normalized forecast errors side by side."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -118,17 +146,17 @@ def plot_normalized_error_comparison(metrics_frame: pd.DataFrame, output_path: s
     normalized_columns = [
         ("NMAE", "#2a9d8f"),
         ("NRMSE", "#f4a261"),
-        ("MAPE", "#7b2cbf"),
+        ("sMAPE", "#7b2cbf"),
     ]
     offsets = np.linspace(-width, width, num=len(normalized_columns))
     for offset, (column, color) in zip(offsets, normalized_columns, strict=False):
         axes[1].bar(x + offset, frame[column], width=width * 0.9, label=column, color=color)
     axes[1].set_xticks(x, labels=models)
     axes[1].set_ylabel("Error (%)")
-    axes[1].set_title("Scale-Aware Error Metrics")
+    axes[1].set_title("Normalized and Percentage Error Metrics")
     axes[1].legend()
 
-    fig.suptitle("Absolute vs. Normalized Forecast Error")
+    fig.suptitle("Forecast Error Comparison")
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     plt.close(fig)
@@ -140,6 +168,8 @@ def plot_error_by_hour(
     predictions_by_model: dict[str, np.ndarray],
     output_path: str | Path,
 ) -> None:
+    """Show whether models fail more at specific hours of the day."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -169,6 +199,8 @@ def plot_decorator_threshold_sensitivity(
     output_path: str | Path,
     model_name: str,
 ) -> None:
+    """Visualize decorator accuracy, usage, and speedup across thresholds."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -222,6 +254,8 @@ def plot_decorator_decision_trace(
     output_path: str | Path,
     model_name: str,
 ) -> None:
+    """Plot rolling error and selected execution path over test steps."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +263,8 @@ def plot_decorator_decision_trace(
     frame["mode_flag"] = frame["mode"].map({"simulation": 0, "surrogate": 1})
     probe_points = frame[frame["probe_executed"].astype(bool)]
 
+    # The first panel explains why mode changes happen; the second panel shows
+    # the actual simulator/surrogate path selected by the decorator.
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
     axes[0].plot(frame["index"], frame["rolling_error_after"], color="#457b9d")
     axes[0].axhline(

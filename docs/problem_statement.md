@@ -66,17 +66,19 @@ The proposed methodology combines offline surrogate learning with online trust-b
 
 Let the system evolve over discrete time steps indexed by `k`. In general form, the system transition is expressed as:
 
-`S_{k+1} = F(S_k, a_k)`
+`F(S_k, p, a_k) \xrightarrow{\Delta t} S_{k+1}`
 
 where:
 
 - `S_k` denotes the system state at time step `k`
+- `p` denotes static model parameters or configuration values
 - `a_k` denotes the external inputs, disturbances, or control-relevant context at time step `k`
+- `\Delta t` denotes the transition interval or forecast duration
 - `F(.)` denotes the underlying system dynamics
 
 For the outer simulation loop, the full internal state `S_{k+1}` is not necessarily required. Instead, the loop typically requires a returned metric derived from that state. This metric is written as:
 
-`y_{k+1} = G(S_{k+1}) = G(F(S_k, a_k))`
+`y_{k+1} = G(S_{k+1})`
 
 In the current implementation, `y_{k+1}` is primarily the next-step `net_load_kw`.
 
@@ -150,18 +152,19 @@ This stage yields a trained surrogate candidate `f_\theta` that can subsequently
 
 ### 6. Decorator-Managed Runtime Integration
 
-After offline training, runtime execution is organized around a common forecast-provider interface. The high-fidelity simulator, the learned surrogate, and the decorated surrogate all expose the same operation:
+After offline training, runtime execution is organized around a common component-transition interface. The high-fidelity simulator component, the learned surrogate component, and the decorated surrogate component follow the same conceptual operation:
 
-`forecast(k) -> y_{k+1}`
+`f(state, parameters, action) --delta_t--> next_state`
 
-This preserves substitutability: a client that requests a forecast does not need to know whether the returned value comes from the raw simulator, the raw surrogate, or a decorated surrogate with trust management. The decorator therefore acts as a runtime architectural component rather than as an offline analysis script.
+In the implementation, `delta_t` is passed as an argument to the component call, while the mathematical interpretation is that it defines the transition period. This preserves substitutability: the surrounding simulator can call a component without needing to know whether the returned next state comes from the raw simulator, the raw surrogate, or a decorated surrogate with trust management. The decorator therefore acts as a runtime architectural component rather than as an offline analysis script.
 
 The implementation separates two roles:
 
-- runtime providers and decorators, which implement `forecast(k)`
+- runtime component functions and decorators, which implement the state-explicit transition contract
+- an offline evaluation adapter, which can still expose `forecast(k)` over prepared validation or test arrays for result generation
 - an evaluation runner, which iterates over a dataset, records traces, and computes thesis metrics
 
-At every time step `k`, the trust-managed decorator decides which provider must actually be executed. If the high-fidelity simulator is selected, the trusted output `y_{k+1}^{HF}` is used as the official output for that step. If the surrogate is selected and no probe is due, only the surrogate is executed and `\hat{y}_{k+1}` is returned. The high-fidelity simulator is executed lazily only during warmup, probing, fallback, or re-entry checks.
+At every time step `k`, the trust-managed decorator decides which component must actually be executed. If the high-fidelity simulator is selected, the trusted next state is used as the official state for that step. If the surrogate is selected and no probe is due, only the surrogate is executed and its next state is returned. The high-fidelity simulator is executed lazily only during warmup, probing, fallback, or re-entry checks.
 
 ### 7. Probe-Based Trust Estimation
 
@@ -241,7 +244,9 @@ reference simulation -> dataset construction -> surrogate training -> decorator-
 For clarity, the main symbols used in the methodology have the following meaning:
 
 - `S_k`: system state at time step `k`
+- `p`: static model parameters or configuration values
 - `a_k`: external input, disturbance, or control context at time step `k`
+- `\Delta t`: transition interval or forecast duration
 - `F(.)`: underlying system dynamics
 - `y_{k+1}`: next-step output metric required by the outer simulation loop
 - `G(.)`: mapping from system state to the returned output metric

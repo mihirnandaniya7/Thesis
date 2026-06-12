@@ -1,3 +1,5 @@
+"""Model evaluation, error metrics, and runtime measurements."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ from surrogate_thesis.training import ModelArtifacts, predict_model
 
 @dataclass(slots=True)
 class EvaluationResult:
+    """Predictions and metrics produced by one evaluated model."""
+
     model_name: str
     metrics: dict[str, float]
     predictions: np.ndarray
@@ -21,6 +25,8 @@ class EvaluationResult:
     hours: np.ndarray
 
     def to_record(self) -> dict[str, float | str]:
+        """Flatten metrics for the experiment metrics CSV."""
+
         return {"model_name": self.model_name, **self.metrics}
 
 
@@ -31,6 +37,8 @@ def evaluate_model(
     normalization: NormalizationStats,
     config: ExperimentConfig,
 ) -> EvaluationResult:
+    """Evaluate one trained model on the normalized test split."""
+
     del reference_simulator  # kept for interface clarity and future extensions
 
     predictions_norm = predict_model(
@@ -39,9 +47,13 @@ def evaluate_model(
         device=config.training.device,
         batch_size=config.training.batch_size,
     )
+    # Error metrics are reported in physical units, so both predictions and
+    # labels are converted back from normalized training scale.
     y_true = _denormalize(test_split.y, normalization)
     y_pred = _denormalize(predictions_norm, normalization)
 
+    # Runtime is measured three ways: single-step latency, batched latency, and
+    # full test-set runtime for the main thesis speedup comparison.
     single_sample_latency_ms = _measure_single_sample_latency_ms(
         artifacts=artifacts,
         X=test_split.X[: config.evaluation.latency_samples],
@@ -91,6 +103,8 @@ def evaluate_model(
 
 
 def _denormalize(values: np.ndarray, normalization: NormalizationStats) -> np.ndarray:
+    """Convert normalized model outputs back to target units."""
+
     return values * normalization.target_std + normalization.target_mean
 
 
@@ -99,6 +113,8 @@ def _measure_single_sample_latency_ms(
     X: np.ndarray,
     device: str,
 ) -> float:
+    """Measure online-style latency by predicting one sample at a time."""
+
     if len(X) == 0:
         return 0.0
 
@@ -121,6 +137,8 @@ def _measure_batched_runtime_ms(
     device: str,
     batch_size: int,
 ) -> dict[str, float]:
+    """Measure average per-sample latency for one batched inference call."""
+
     if len(X) == 0:
         return {"wall_time_ms": 0.0, "per_sample_latency_ms": 0.0, "batch_size": float(batch_size)}
 
@@ -145,6 +163,8 @@ def _measure_full_test_runtime_ms(
     device: str,
     batch_size: int,
 ) -> float:
+    """Measure wall-clock runtime for inference over the full test split."""
+
     if len(X) == 0:
         return 0.0
 

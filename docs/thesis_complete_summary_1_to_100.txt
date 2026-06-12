@@ -1,0 +1,256 @@
+Thesis Complete Summary: From 1 to 100
+Title: Surrogate Modeling Based on Machine Learning Approaches for Hospitals as Microgrids
+Last updated: 2026-06-11
+
+Core Thesis Summary
+
+1. The thesis studies hospitals as microgrids because hospitals require reliable and continuous electrical energy.
+2. A hospital microgrid is modeled as a system with electrical demand, photovoltaic generation, battery storage, and grid interaction.
+3. The implementation focuses on short-term energy behavior rather than long-term grid planning.
+4. The main simulated variables are load_kw, pv_kw, battery_soc_kwh, battery_power_kw, and net_load_kw.
+5. The main prediction target in the current quantitative experiment is next-step net_load_kw.
+6. The experiment uses 15-minute external time steps.
+7. The prediction horizon is one step ahead.
+8. The learning dataset uses a lookback window of 32 time steps.
+9. Because each step is 15 minutes, 32 steps represent 8 hours of recent history.
+10. The thesis should be explained as a simulator-integration thesis, not only as a time-series forecasting thesis.
+
+Reference Simulator
+
+11. The trusted reference model is a synthetic hospital microgrid simulator.
+12. The simulator is synthetic, so the thesis does not claim validation on real hospital measurements.
+13. The simulator is still the ground truth within the scope of the experiment.
+14. It generates controlled time-series trajectories for load, PV, battery behavior, and net load.
+15. It includes daily demand structure.
+16. It includes weekday and weekend behavior.
+17. It includes seasonal variation.
+18. It includes stochastic disturbances.
+19. It includes occasional peak events.
+20. It includes photovoltaic production and battery state-of-charge dynamics.
+21. The simulator produces the labels used for surrogate training.
+22. The simulator also provides trusted outputs for validation, testing, probes, and fallback behavior.
+23. The simulator is implemented in surrogate_thesis/simulation/reference_simulator.py.
+24. The main simulator entry point is ReferenceSimulator.generate_series(...).
+25. The simulator internally advances through finer substeps inside each 15-minute interval.
+
+Dataset And Forecasting Task
+
+26. The raw simulator trajectory is converted into supervised learning windows.
+27. The current window input features are load_kw, pv_kw, battery_soc_kwh, net_load_kw, hour_sin, hour_cos, and is_weekend.
+28. The current target is next-step net_load_kw.
+29. The dataset is split chronologically into train, validation, and test sections.
+30. Chronological splitting avoids future-data leakage.
+31. Normalization statistics are computed only from the training split.
+32. The same normalization values are applied to validation and test data.
+33. This prevents information from the future test period leaking into training.
+34. Sliding-window construction is implemented in surrogate_thesis/data/dataset.py.
+35. The current quantitative forecasting path is a supervised offline evaluation over prepared test windows.
+
+Surrogate Models
+
+36. Four model families are used in the current experiment.
+37. Persistence is the naive baseline.
+38. Persistence predicts the next value as the most recent observed target value.
+39. Linear Regression is the simple classical baseline.
+40. LSTM is the main recurrent sequence baseline.
+41. The Transformer is an encoder-only regression model, not BERT and not GPT.
+42. LSTM and Transformer use the 32-step history to predict the next net-load value.
+43. The standalone models are evaluated by accuracy and runtime.
+44. The current best standalone surrogate by accuracy is the LSTM.
+45. The Transformer is slightly less accurate as a pure surrogate but becomes important in the decorated runtime results.
+
+Component Transition Architecture
+
+46. After Jonathan's review, the implementation was refactored toward a state-explicit component interface.
+47. The thesis-facing component equation is f(state, parameters, action) --delta_t--> next_state.
+48. In code, this is component_step(state, parameters, action, delta_t) -> next_state.
+49. State contains dynamic variables that evolve over time.
+50. Parameters contain fixed configuration values.
+51. Action contains external inputs, disturbances, or control-relevant values for the current step.
+52. Delta_t is the time interval of the transition.
+53. Next_state means the same conceptual state variables after the transition, with updated values.
+54. State and next_state should not be explained as different kinds of objects.
+55. Output values such as load_kw, pv_kw, and net_load_kw are observables produced during the step.
+56. The current implementation sometimes returns updated state together with observable output fields in the same dictionary.
+57. This should be explained as "updated state plus outputs", not as "state and next_state have unrelated fields".
+58. The component transition contract is implemented in surrogate_thesis/simulation/component_interface.py.
+59. ComponentState, ComponentParameters, and ComponentAction are dictionary type aliases.
+60. ComponentModel and ComponentStep define the common callable signature.
+
+Real Simulator Components
+
+61. The reference simulator now exposes explicit component functions.
+62. load_component_step(...) represents one load transition.
+63. pv_component_step(...) represents one PV transition.
+64. battery_component_step(...) represents one battery transition.
+65. The load component uses timestamp context, weekday/weekend information, stochastic noise, peak events, and internal load state.
+66. The PV component uses timestamp context, daylight structure, seasonal structure, cloud disturbance, and cloud state.
+67. The battery component uses battery_soc_kwh, battery capacity, battery power limit, load_kw, pv_kw, and delta_t.
+68. The old _simulate_load_substep(...) method now delegates to load_component_step(...).
+69. The old _simulate_pv_substep(...) method now delegates to pv_component_step(...).
+70. The old _apply_battery(load_kw, pv_kw, dt_hours) method now delegates to battery_component_step(...).
+71. This directly addresses the earlier concern that the real simulator methods were not visibly connected to the component interface.
+72. The simulator still has an object-oriented wrapper for full trajectory generation.
+73. component_state(), component_parameters(), and replace_component_state(...) bridge between the object state and the explicit component dictionaries.
+
+Decorator Architecture
+
+74. The runtime architecture uses a decorator-style integration layer.
+75. The decorator decides whether a step should use the surrogate or the trusted simulator.
+76. The HybridController implements the switching policy.
+77. The policy includes warmup, probes, fallback, cooldown, re-entry, rolling error, thresholds, and hysteresis.
+78. Probe steps run both surrogate and simulator to observe error.
+79. Surrogate-only steps do not know the simulator answer and therefore cannot update observed error from ground truth.
+80. Fallback steps use the trusted simulator when surrogate trust is low.
+81. Lazy simulator execution means the simulator is not secretly executed at every step.
+82. ComponentSurrogateDecorator is implemented in surrogate_thesis/controller/surrogate_decorator.py.
+83. It can wrap a trusted simulator component and a surrogate component that share the component transition interface.
+84. ComponentModelAdapter wraps plain component functions into the step(...) provider form.
+85. The older ForecastProvider.forecast(index) layer still exists.
+86. Forecast(index) is the stable offline evaluation adapter for prepared validation and test arrays.
+87. The current final metrics and plots are generated through this forecast-index evaluation path.
+88. The component-level decorator is implemented as the architectural integration layer.
+89. A full quantitative component-level rollout evaluation is not the current final result pipeline.
+90. This distinction must be stated clearly in the thesis and meeting discussion.
+
+Evaluation And Results
+
+91. The current corrected result directory is artifacts/decorator_architecture_current.
+92. The old result with around 98 percent surrogate usage should not be reported as the final result.
+93. Current standalone LSTM MAE is 0.0623 kW and NMAE is 3.28 percent.
+94. Current standalone Transformer MAE is 0.0648 kW and NMAE is 3.41 percent.
+95. Current standalone Linear Regression MAE is 0.0700 kW and NMAE is 3.69 percent.
+96. Current standalone Persistence MAE is 0.0954 kW and NMAE is 5.02 percent.
+97. Current LSTM decorator MAE is 0.0432 kW, NMAE is 2.28 percent, surrogate usage is 78.19 percent, and speedup is 0.86x.
+98. Current Transformer decorator MAE is 0.0437 kW, NMAE is 2.30 percent, surrogate usage is 74.88 percent, and speedup is 1.12x.
+99. LSTM decorator is the best accuracy-oriented decorated result.
+100. Transformer decorator is the better runtime-oriented decorated result because it achieves speedup above 1 while keeping error controlled.
+
+Current Artifact Summary
+
+- Main artifact directory: artifacts/decorator_architecture_current
+- Standalone metrics: artifacts/decorator_architecture_current/metrics.csv
+- Decorator metrics: artifacts/decorator_architecture_current/decorator/decorator_summary.csv
+- Test predictions: artifacts/decorator_architecture_current/test_predictions.csv
+- Prediction overview plot: artifacts/decorator_architecture_current/plots/prediction_overview.png
+- Residual plot: artifacts/decorator_architecture_current/plots/residuals.png
+- Runtime comparison plot: artifacts/decorator_architecture_current/plots/runtime_comparison.png
+- Normalized error plot: artifacts/decorator_architecture_current/plots/normalized_error_comparison.png
+- Error-by-hour plot: artifacts/decorator_architecture_current/plots/error_by_hour.png
+- LSTM decision trace: artifacts/decorator_architecture_current/decorator/lstm_decision_trace.png
+- Transformer decision trace: artifacts/decorator_architecture_current/decorator/transformer_decision_trace.png
+- Alignment evidence: artifacts/decorator_architecture_current/alignment_check.csv
+- Shift evidence: artifacts/decorator_architecture_current/alignment_shift_check.csv
+
+Standalone Result Summary
+
+- LSTM: MAE 0.0623 kW, RMSE 0.0833, NMAE 3.28 percent, NRMSE 4.39 percent, full-test speedup 8.47x.
+- Transformer: MAE 0.0648 kW, RMSE 0.0876, NMAE 3.41 percent, NRMSE 4.61 percent, full-test speedup 4.48x.
+- Linear Regression: MAE 0.0700 kW, RMSE 0.0895, NMAE 3.69 percent, NRMSE 4.71 percent, very high runtime speedup because it is a simple model.
+- Persistence: MAE 0.0954 kW, RMSE 0.1207, NMAE 5.02 percent, NRMSE 6.36 percent.
+
+Decorator Result Summary
+
+- LSTM decorator: MAE 0.0432 kW, RMSE 0.0648, NMAE 2.28 percent, NRMSE 3.41 percent.
+- LSTM decorator: surrogate usage 78.19 percent, simulator usage 21.81 percent, switch count 5, speedup 0.86x.
+- Transformer decorator: MAE 0.0437 kW, RMSE 0.0678, NMAE 2.30 percent, NRMSE 3.57 percent.
+- Transformer decorator: surrogate usage 74.88 percent, simulator usage 25.12 percent, switch count 7, speedup 1.12x.
+- LSTM decorator improves accuracy most strongly but is slower than simulator-only in this run.
+- Transformer decorator gives the best balanced runtime result because speedup is greater than 1.
+- Speedup means simulator runtime divided by decorated runtime.
+- A speedup below 1 means the decorated path is slower than simulator-only.
+- A speedup above 1 means the decorated path is faster than simulator-only.
+
+Alignment And Plot Corrections
+
+- Jonathan observed that the prediction overview plot might contain a one-step indexing error.
+- The current implementation includes scripts/generate_alignment_evidence.py to generate alignment evidence.
+- alignment_check.csv verifies that y_true matches the raw simulator target at the plotted timestamp.
+- In the current alignment_check.csv, target_matches_raw is True for the checked samples.
+- The same file verifies that persistence predicts the last input target value.
+- In the current alignment_check.csv, persistence_matches_last_input is True for the checked samples.
+- alignment_shift_check.csv recomputes MAE after shifting predictions by -2, -1, 0, +1, and +2 steps.
+- For LSTM, Transformer, and Linear Regression, best_shift_steps is 0.
+- This means the current saved learned-model predictions do not show a global one-step shift.
+- Persistence has best_shift_steps = -1, which is expected because persistence predicts the previous value by definition.
+- Residual plots were updated to use shared residual bounds and density normalization.
+- In surrogate_thesis/evaluation/plots.py, plot_residual_overview(...) uses common bins, common x limits, common y limits, and density=True.
+- This satisfies the feedback that residual distributions should be comparable across models.
+
+Research And Literature Positioning
+
+- Balduin et al. on surrogate models for composed energy-system simulations supports the core idea that expensive energy simulation components can be approximated by surrogate models.
+- The fit to this thesis is the energy-system context, composed simulation setting, black-box approximation idea, and runtime-reduction motivation.
+- The limitation is that this thesis uses a synthetic hospital microgrid and a Python prototype rather than a large validated external energy-system case study.
+- mosaik supports the interface and co-simulation argument.
+- The fit to this thesis is the idea that simulators should communicate through clear APIs and that models can be integrated into a larger simulation workflow.
+- FMI supports the same theoretical direction from a standardization perspective.
+- The fit to this thesis is the idea of model exchange, co-simulation, and simulator components with defined inputs, outputs, states, and time advancement.
+- HELICS can be mentioned as related co-simulation infrastructure, but it is not implemented in this codebase.
+- Roberts et al. on surrogate-assisted time stepping supports the hybrid idea of using a surrogate while retaining a trusted high-fidelity model for correction or supervision.
+- The fit to this thesis is the runtime relationship between fast surrogate execution and occasional trusted model execution.
+- Gamma et al. Design Patterns supports the naming of Adapter and Decorator.
+- In this thesis, an adapter normalizes different providers to a shared interface.
+- In this thesis, a decorator adds trust management, probing, fallback, and recalibration without changing the underlying simulator component's conceptual role.
+- The literature should be used to justify architecture and methodology, not to claim that the prototype fully implements mosaik, FMI, or HELICS.
+
+Current Code Map
+
+- scripts/run_pipeline.py: command-line entry point for the experiment.
+- scripts/generate_alignment_evidence.py: creates alignment_check.csv and alignment_shift_check.csv.
+- surrogate_thesis/pipeline.py: orchestrates simulation, dataset construction, training, evaluation, plotting, and decorator evaluation.
+- surrogate_thesis/simulation/component_interface.py: defines the component transition contract.
+- surrogate_thesis/simulation/reference_simulator.py: trusted synthetic simulator plus load, PV, and battery component functions.
+- surrogate_thesis/data/dataset.py: builds sliding windows, component transition samples, splits, and normalization.
+- surrogate_thesis/models/baselines.py: Persistence and Linear Regression baselines.
+- surrogate_thesis/models/sequence.py: LSTM surrogate model.
+- surrogate_thesis/models/transformer.py: encoder-only Transformer regressor.
+- surrogate_thesis/training/trainer.py: model fitting, checkpointing, and prediction utilities.
+- surrogate_thesis/evaluation/metrics.py: MAE, RMSE, MAPE, sMAPE, NMAE, and NRMSE.
+- surrogate_thesis/evaluation/evaluator.py: denormalizes predictions and computes final standalone model metrics.
+- surrogate_thesis/evaluation/plots.py: prediction, residual, runtime, normalized-error, error-by-hour, threshold, and decision-trace plots.
+- surrogate_thesis/controller/hybrid_controller.py: switching policy and trust-control decisions.
+- surrogate_thesis/controller/surrogate_decorator.py: component decorator, forecast adapters, rolling error tracking, online recalibration, decorator evaluation runner.
+- tests/test_dataset.py: validates window alignment and component transition dataset structure.
+- tests/test_decorator.py: validates decorator switching, probing, cooldown, recalibration, and component decorator behavior.
+- tests/test_simulator.py: validates simulator reproducibility, Stage 2 columns, and battery component equivalence.
+- tests/test_smoke.py: validates that the smoke experiment runs end to end.
+
+Current Verification Status
+
+- The local test command is python3 -m unittest discover -s tests -v.
+- On 2026-06-11 this command ran successfully.
+- Result: 16 tests ran and all passed.
+- Important checked behaviors include dataset window alignment, component transition dataset construction, battery component matching the old simulator method, component decorator switching, probe behavior, cooldown behavior, recalibration behavior, and smoke pipeline execution.
+
+Important Honest Scope Statement
+
+The current quantitative metrics are generated through the stable offline forecast-index evaluation path. The component-level decorator and component transition interface are implemented as the thesis-facing architecture layer. A full step-by-step component-level quantitative rollout, where trained component surrogates replace load, PV, or battery components inside a live trajectory loop, is the natural next refinement but is not the current reported result pipeline.
+
+Meeting-Ready Explanation
+
+My thesis designs and evaluates a surrogate-integrated simulation workflow for a hospital microgrid. The reference simulator is treated as the trusted model and generates synthetic load, PV, battery, and net-load trajectories. Surrogate models are trained from these trajectories to predict next-step net load from recent history. The decorator then manages when the surrogate is trusted and when the system should fall back to the reference simulator.
+
+After the review feedback, I made the simulator architecture more explicit. The component-level interface is now state, parameters, action, and delta_t to next_state. Load, PV, and battery are exposed as component transition functions, and the old battery method now delegates to battery_component_step. I also added ComponentSurrogateDecorator, which can wrap simulator and surrogate components with the same interface.
+
+For final reported numbers, I keep the stable offline forecast-index pipeline. This path gives the current metrics, plots, decorator traces, and alignment evidence. The component-level architecture is implemented and documented, while a full component-level quantitative rollout is listed as future work because adding that late would risk destabilizing the current thesis results.
+
+One-Sentence Thesis Description
+
+This thesis implements and evaluates a decorator-managed surrogate simulation architecture for hospital microgrid forecasting, where machine-learning models approximate a trusted simulator and a runtime controller switches back to the simulator when surrogate trust is low.
+
+Hospital Real-World Explanation
+
+In a hospital, electrical demand changes because of medical equipment, HVAC, lighting, IT systems, and emergency events. PV panels may produce local energy during the day, and a battery can charge or discharge depending on load and solar production. The simulator represents this hospital energy system in detail. The surrogate is a faster learned approximation. The decorator decides when the fast surrogate is accurate enough and when the trusted simulator should be used instead. This is useful because hospital energy planning may require many repeated simulations, but safety-critical decisions still need a reliable fallback.
+
+Important Warnings For Report Writing
+
+- Do not report the old 98 percent surrogate usage result as the final result.
+- Use artifacts/decorator_architecture_current for current numeric results.
+- Do not claim that the current quantitative metrics come from a full component-level rollout.
+- State clearly that the metrics come from the stable offline forecast-index evaluation path.
+- State clearly that the component transition interface and ComponentSurrogateDecorator are implemented as the stronger architecture layer.
+- When explaining state and next_state, say they are the same conceptual variables at different times.
+- When explaining prediction_overview.png, mention that alignment evidence was added after the suspected shift issue.
+- When explaining residuals.png, mention that the plot now uses density normalization and shared axes.
+- When explaining literature, use the papers to justify the architecture and methodology, not to overclaim full compliance with any external co-simulation standard.

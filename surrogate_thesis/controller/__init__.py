@@ -1,5 +1,11 @@
+"""Controller and decorator interfaces for runtime surrogate switching."""
+
 from surrogate_thesis.controller.hybrid_controller import HybridController
 from surrogate_thesis.controller.surrogate_decorator import (
+    ComponentModelAdapter,
+    ComponentStepProvider,
+    ComponentStepResult,
+    ComponentSurrogateDecorator,
     DecoratorEvaluationArtifacts,
     DecoratorEvaluationRunner,
     ForecastProvider,
@@ -15,6 +21,10 @@ from surrogate_thesis.controller.surrogate_decorator import (
 
 __all__ = [
     "HybridController",
+    "ComponentModelAdapter",
+    "ComponentStepProvider",
+    "ComponentStepResult",
+    "ComponentSurrogateDecorator",
     "ForecastProvider",
     "ForecastProviderDecorator",
     "ForecastResult",

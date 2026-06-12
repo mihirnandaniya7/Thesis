@@ -1,3 +1,5 @@
+"""Typed experiment configuration for the surrogate thesis pipeline."""
+
 from __future__ import annotations
 
 import json
@@ -7,6 +9,8 @@ from typing import Any
 
 
 def _construct_dataclass(cls: type, data: dict[str, Any]) -> Any:
+    """Instantiate a dataclass while ignoring unknown JSON keys."""
+
     valid_fields = {item.name for item in fields(cls)}
     payload = {key: value for key, value in data.items() if key in valid_fields}
     return cls(**payload)
@@ -14,6 +18,8 @@ def _construct_dataclass(cls: type, data: dict[str, Any]) -> Any:
 
 @dataclass(slots=True)
 class SimulatorConfig:
+    """Parameters controlling the synthetic reference simulator."""
+
     start: str = "2025-01-01"
     days: int = 120
     time_resolution_minutes: int = 15
@@ -37,6 +43,8 @@ class SimulatorConfig:
 
 @dataclass(slots=True)
 class DatasetConfig:
+    """Settings for supervised window creation and chronological splitting."""
+
     lookback: int = 16
     horizon: int = 1
     feature_columns: list[str] = field(
@@ -50,6 +58,8 @@ class DatasetConfig:
 
 @dataclass(slots=True)
 class ModelConfig:
+    """Hyperparameters for learned neural surrogate models."""
+
     lstm_hidden_size: int = 64
     lstm_num_layers: int = 2
     transformer_d_model: int = 64
@@ -61,6 +71,8 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
+    """Optimization settings shared by trainable models."""
+
     device: str = "cpu"
     batch_size: int = 128
     learning_rate: float = 1e-3
@@ -71,12 +83,16 @@ class TrainingConfig:
 
 @dataclass(slots=True)
 class EvaluationConfig:
+    """Evaluation and plotting settings for saved experiment artifacts."""
+
     latency_samples: int = 256
     prediction_plot_points: int = 288
 
 
 @dataclass(slots=True)
 class DecoratorConfig:
+    """Runtime switching and recalibration settings for the decorator layer."""
+
     enabled: bool = True
     candidate_model_names: list[str] = field(default_factory=lambda: ["lstm", "transformer"])
     rolling_window: int = 24
@@ -102,6 +118,8 @@ class DecoratorConfig:
 
 @dataclass(slots=True)
 class ExperimentConfig:
+    """Top-level configuration object for one complete experiment run."""
+
     run_name: str = "baseline_v1"
     seed: int = 42
     model_names: list[str] = field(
@@ -116,6 +134,8 @@ class ExperimentConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExperimentConfig":
+        """Build a nested ExperimentConfig from a JSON-style dictionary."""
+
         config = _construct_dataclass(cls, data)
         if isinstance(data.get("simulator"), dict):
             config.simulator = _construct_dataclass(SimulatorConfig, data["simulator"])
@@ -133,11 +153,17 @@ class ExperimentConfig:
 
     @classmethod
     def load(cls, path: str | Path) -> "ExperimentConfig":
+        """Load an experiment configuration from disk."""
+
         payload = json.loads(Path(path).read_text())
         return cls.from_dict(payload)
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert the nested dataclasses into JSON-serializable dictionaries."""
+
         return asdict(self)
 
     def save(self, path: str | Path) -> None:
+        """Save the resolved configuration next to experiment artifacts."""
+
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))

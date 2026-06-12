@@ -1,3 +1,5 @@
+"""Transformer-based neural surrogate for sequence forecasting."""
+
 from __future__ import annotations
 
 import math
@@ -7,7 +9,11 @@ from torch import nn
 
 
 class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for ordered lookback windows."""
+
     def __init__(self, d_model: int, max_len: int = 512) -> None:
+        """Precompute fixed encodings up to max_len."""
+
         super().__init__()
         position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
@@ -19,10 +25,14 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add time-position information to projected input features."""
+
         return x + self.pe[:, : x.size(1)]
 
 
 class TransformerRegressor(nn.Module):
+    """Encoder-only Transformer surrogate with a regression head."""
+
     def __init__(
         self,
         input_dim: int,
@@ -33,6 +43,8 @@ class TransformerRegressor(nn.Module):
         horizon: int,
         dropout: float,
     ) -> None:
+        """Create projection, positional encoding, encoder, and output head."""
+
         super().__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.position = PositionalEncoding(d_model=d_model)
@@ -54,7 +66,8 @@ class TransformerRegressor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forecast from the encoded representation of the latest window step."""
+
         embedded = self.input_projection(x)
         encoded = self.encoder(self.position(embedded))
         return self.head(encoded[:, -1, :])
-

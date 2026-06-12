@@ -1,10 +1,12 @@
+"""Runtime decorators that manage trust between surrogate and simulator paths."""
+
 from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 import warnings
 
 import numpy as np
@@ -14,6 +16,12 @@ import torch
 from surrogate_thesis.config import ExperimentConfig
 from surrogate_thesis.data.dataset import DatasetSplit, NormalizationStats
 from surrogate_thesis.evaluation.metrics import mae, mape, nmae, nrmse, rmse, smape
+from surrogate_thesis.simulation.component_interface import (
+    ComponentAction,
+    ComponentParameters,
+    ComponentState,
+    ComponentStep,
+)
 from surrogate_thesis.training import ModelArtifacts, predict_model
 
 from .hybrid_controller import HybridController
@@ -21,6 +29,8 @@ from .hybrid_controller import HybridController
 
 @dataclass(slots=True)
 class ForecastResult:
+    """Forecast value plus runtime metadata from one execution path."""
+
     value: np.ndarray
     runtime_ms: float
     source: str
@@ -28,20 +38,338 @@ class ForecastResult:
 
 
 class ForecastProvider(Protocol):
-    """Common runtime interface for raw and decorated forecast providers."""
+    """Common interface for anything that can forecast one indexed test step."""
 
     def forecast(self, index: int) -> ForecastResult:
+        """Return a forecast result for one chronological index."""
+
         ...
 
 
 @dataclass(slots=True)
+class ComponentStepResult:
+    """Component transition output plus runtime metadata."""
+
+    state: ComponentState
+    runtime_ms: float
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ComponentStepProvider(Protocol):
+    """Runtime wrapper around the component transition contract."""
+
+    def step(
+        self,
+        state: ComponentState,
+        parameters: ComponentParameters,
+        action: ComponentAction,
+        delta_t: float,
+    ) -> ComponentStepResult:
+        """Return the next component state for one transition."""
+
+        ...
+
+
+@dataclass(slots=True)
+class ComponentModelAdapter:
+    """Expose a plain component function as a runtime provider."""
+
+    model: ComponentStep
+    source: str
+
+    def step(
+        self,
+        state: ComponentState,
+        parameters: ComponentParameters,
+        action: ComponentAction,
+        delta_t: float,
+    ) -> ComponentStepResult:
+        """Execute the wrapped component transition and measure wall time."""
+
+        start = perf_counter()
+        next_state = self.model(
+            dict(state),
+            dict(parameters),
+            dict(action),
+            float(delta_t),
+        )
+        return ComponentStepResult(
+            state=dict(next_state),
+            runtime_ms=(perf_counter() - start) * 1000,
+            source=self.source,
+            metadata={
+                "simulation_executed": self.source == "simulation",
+                "surrogate_executed": self.source == "surrogate",
+            },
+        )
+
+    def observe_trusted_state(self, **payload: Any) -> Any:
+        """Forward trusted-state observations to adaptive surrogate components."""
+
+        observer = getattr(self.model, "observe_trusted_state", None)
+        if observer is None:
+            return None
+        return observer(**payload)
+
+
+class ComponentSurrogateDecorator:
+    """Trust-managed decorator for real simulator component transitions.
+
+    This is the component-level counterpart to the older forecast(index) runtime
+    path. Both the trusted simulator component and surrogate component receive:
+
+    state + parameters + action --delta_t--> next_state
+    """
+
+    def __init__(
+        self,
+        *,
+        surrogate: ComponentStepProvider | ComponentStep,
+        simulator: ComponentStepProvider | ComponentStep,
+        controller: HybridController,
+        rolling_window: int,
+        warmup_steps: int,
+        error_keys: Sequence[str] | None = None,
+        component_name: str = "component",
+    ) -> None:
+        self.surrogate = _as_component_provider(surrogate, source="surrogate")
+        self.simulator = _as_component_provider(simulator, source="simulation")
+        self.controller = controller
+        self.rolling_window = rolling_window
+        self.warmup_steps = warmup_steps
+        self.error_keys = tuple(error_keys) if error_keys is not None else None
+        self.component_name = component_name
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear runtime memory before a fresh decorated evaluation."""
+
+        self.tracker = RollingErrorTracker(window_size=self.rolling_window)
+        self.selected_path_previous: str | None = None
+        self.controller_mode = "simulation"
+        self.cooldown_remaining = 0
+        self.surrogate_validation_count = 0
+        self.switch_count = 0
+        self.step_index = 0
+
+    def step(
+        self,
+        state: ComponentState,
+        parameters: ComponentParameters,
+        action: ComponentAction,
+        delta_t: float,
+    ) -> ComponentStepResult:
+        """Run one component step through warmup, probe, surrogate, or fallback."""
+
+        index = self.step_index
+        self.step_index += 1
+
+        rolling_error_before = self.tracker.mean_error
+        steps_since_last_observation = self.tracker.steps_since_last_observation(index)
+        cooldown_before = self.cooldown_remaining
+        probe_executed = False
+        observed_error = float("nan")
+        surrogate_result: ComponentStepResult | None = None
+        simulation_result: ComponentStepResult | None = None
+        rolling_error_after = rolling_error_before
+        reason = "simulation_hold"
+
+        # Warmup deliberately executes both paths so the controller starts from
+        # measured surrogate-vs-simulator error instead of an empty estimate.
+        if index < self.warmup_steps:
+            surrogate_result = self.surrogate.step(state, parameters, action, delta_t)
+            simulation_result = self.simulator.step(state, parameters, action, delta_t)
+            probe_executed = True
+            observed_error = _component_state_error(
+                surrogate_result.state,
+                simulation_result.state,
+                self.error_keys,
+            )
+            rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+            selected_path = "simulation"
+            reason = "warmup_probe"
+            self.controller_mode = self.controller.decide(
+                rolling_error_after,
+                current_mode="simulation",
+            )
+        elif self.controller_mode == "surrogate":
+            # In surrogate mode, periodic probes refresh the rolling error and
+            # can trigger fallback if accuracy has drifted beyond the exit limit.
+            if self.controller.should_probe(
+                current_mode=self.controller_mode,
+                steps_since_last_observation=steps_since_last_observation,
+                cooldown_remaining=self.cooldown_remaining,
+                error_estimate=rolling_error_before,
+                allow_relaxed_interval=self.surrogate_validation_count > 0,
+            ):
+                surrogate_result = self.surrogate.step(state, parameters, action, delta_t)
+                simulation_result = self.simulator.step(state, parameters, action, delta_t)
+                probe_executed = True
+                observed_error = _component_state_error(
+                    surrogate_result.state,
+                    simulation_result.state,
+                    self.error_keys,
+                )
+                rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+                if self.controller.should_fallback_to_simulation(rolling_error_after):
+                    selected_path = "simulation"
+                    reason = "validation_probe_fallback"
+                    self.controller_mode = "simulation"
+                    self.cooldown_remaining = self.controller.simulation_cooldown_steps
+                else:
+                    selected_path = "surrogate"
+                    reason = "validation_probe_keep"
+                self.surrogate_validation_count += 1
+            else:
+                surrogate_result = self.surrogate.step(state, parameters, action, delta_t)
+                selected_path = "surrogate"
+                reason = "trusted_surrogate"
+        elif self.cooldown_remaining > 0:
+            # After a fallback, cooldown keeps the simulator active long enough
+            # to avoid immediately re-entering an unstable surrogate region.
+            simulation_result = self.simulator.step(state, parameters, action, delta_t)
+            selected_path = "simulation"
+            reason = "simulation_cooldown"
+            self.cooldown_remaining -= 1
+        elif self.controller.should_probe(
+            current_mode=self.controller_mode,
+            steps_since_last_observation=steps_since_last_observation,
+            cooldown_remaining=self.cooldown_remaining,
+            error_estimate=rolling_error_before,
+        ):
+            # Reentry probes test whether the surrogate can be trusted again
+            # without committing to it for all following steps.
+            surrogate_result = self.surrogate.step(state, parameters, action, delta_t)
+            simulation_result = self.simulator.step(state, parameters, action, delta_t)
+            probe_executed = True
+            observed_error = _component_state_error(
+                surrogate_result.state,
+                simulation_result.state,
+                self.error_keys,
+            )
+            rolling_error_after = self.tracker.observe(step_index=index, error=observed_error)
+            if self.controller.should_enter_surrogate(rolling_error_after):
+                selected_path = "surrogate"
+                reason = "reentry_probe_accept"
+                self.controller_mode = "surrogate"
+            else:
+                selected_path = "simulation"
+                reason = "reentry_probe_reject"
+        else:
+            simulation_result = self.simulator.step(state, parameters, action, delta_t)
+            selected_path = "simulation"
+            reason = "simulation_hold"
+
+        # When both paths are available, the simulator state is the trusted label
+        # used by online/adaptive surrogate components.
+        if surrogate_result is not None and simulation_result is not None:
+            self._observe_trusted_state(
+                step_index=index,
+                input_state=state,
+                parameters=parameters,
+                action=action,
+                delta_t=delta_t,
+                surrogate_result=surrogate_result,
+                simulation_result=simulation_result,
+            )
+
+        if selected_path == "surrogate":
+            if surrogate_result is None:
+                surrogate_result = self.surrogate.step(state, parameters, action, delta_t)
+            selected_result = surrogate_result
+        else:
+            if simulation_result is None:
+                simulation_result = self.simulator.step(state, parameters, action, delta_t)
+            selected_result = simulation_result
+
+        if self.selected_path_previous is not None and self.selected_path_previous != selected_path:
+            self.switch_count += 1
+        self.selected_path_previous = selected_path
+
+        metadata = {
+            **selected_result.metadata,
+            "component_name": self.component_name,
+            "index": index,
+            "mode": selected_path,
+            "controller_mode": self.controller_mode,
+            "reason": reason,
+            "probe_executed": probe_executed,
+            "cooldown_remaining_before": float(cooldown_before),
+            "cooldown_remaining_after": float(self.cooldown_remaining),
+            "steps_since_last_observation": float(steps_since_last_observation),
+            "entry_threshold": float(self.controller.entry_threshold),
+            "exit_threshold": float(self.controller.exit_threshold),
+            "threshold": float(self.controller.threshold),
+            "rolling_error_before": rolling_error_before,
+            "rolling_error_after": rolling_error_after,
+            "observed_error": observed_error,
+            "simulation_executed": simulation_result is not None,
+            "surrogate_executed": surrogate_result is not None,
+            "simulation_runtime_ms": (
+                float(simulation_result.runtime_ms) if simulation_result is not None else 0.0
+            ),
+            "surrogate_runtime_ms": (
+                float(surrogate_result.runtime_ms) if surrogate_result is not None else 0.0
+            ),
+            "simulation_state": (
+                dict(simulation_result.state) if simulation_result is not None else None
+            ),
+            "surrogate_state": (
+                dict(surrogate_result.state) if surrogate_result is not None else None
+            ),
+            "switch_count": float(self.switch_count),
+        }
+
+        return ComponentStepResult(
+            state=dict(selected_result.state),
+            runtime_ms=float(
+                (surrogate_result.runtime_ms if surrogate_result is not None else 0.0)
+                + (simulation_result.runtime_ms if simulation_result is not None else 0.0)
+            ),
+            source=selected_path,
+            metadata=metadata,
+        )
+
+    def _observe_trusted_state(
+        self,
+        *,
+        step_index: int,
+        input_state: ComponentState,
+        parameters: ComponentParameters,
+        action: ComponentAction,
+        delta_t: float,
+        surrogate_result: ComponentStepResult,
+        simulation_result: ComponentStepResult,
+    ) -> None:
+        """Let a surrogate component learn from a trusted simulator transition."""
+
+        observer = getattr(self.surrogate, "observe_trusted_state", None)
+        if observer is None:
+            return
+        observer(
+            step_index=step_index,
+            input_state=input_state,
+            parameters=parameters,
+            action=action,
+            delta_t=delta_t,
+            predicted_state=surrogate_result.state,
+            trusted_state=simulation_result.state,
+        )
+
+
+@dataclass(slots=True)
 class HighFidelitySimulationAdapter:
+    """Expose trusted simulator targets through the forecast(index) interface."""
+
     y_true: np.ndarray
     runtime_ms: np.ndarray
     timestamps: np.ndarray
     hours: np.ndarray
 
     def forecast(self, index: int) -> ForecastResult:
+        """Return the simulator value and stored runtime at one test index."""
+
         return ForecastResult(
             value=self.value_at(index),
             runtime_ms=float(self.runtime_ms[index]),
@@ -55,6 +383,8 @@ class HighFidelitySimulationAdapter:
         )
 
     def value_at(self, index: int) -> np.ndarray:
+        """Return the simulator target without wrapping it in ForecastResult."""
+
         return np.asarray(self.y_true[index], dtype=np.float32)
 
     def __len__(self) -> int:
@@ -63,10 +393,14 @@ class HighFidelitySimulationAdapter:
 
 @dataclass(slots=True)
 class SurrogateModelAdapter:
+    """Expose saved surrogate predictions through the forecast(index) interface."""
+
     y_pred: np.ndarray
     runtime_ms: np.ndarray
 
     def forecast(self, index: int) -> ForecastResult:
+        """Return the surrogate prediction and estimated streaming runtime."""
+
         return ForecastResult(
             value=self.value_at(index),
             runtime_ms=float(self.runtime_ms[index]),
@@ -79,6 +413,8 @@ class SurrogateModelAdapter:
         )
 
     def value_at(self, index: int) -> np.ndarray:
+        """Return the raw surrogate prediction for metric calculations."""
+
         return np.asarray(self.y_pred[index], dtype=np.float32)
 
     def __len__(self) -> int:
@@ -87,6 +423,8 @@ class SurrogateModelAdapter:
 
 @dataclass(slots=True)
 class OnlineRecalibrationManager:
+    """Fit a small online linear correction from trusted simulator labels."""
+
     min_samples: int
     update_interval_steps: int
     max_samples: int
@@ -99,18 +437,26 @@ class OnlineRecalibrationManager:
     last_update_step: int = -1
 
     def __post_init__(self) -> None:
+        """Create bounded buffers for recent trusted observations."""
+
         self.sample_predictions = deque(maxlen=self.max_samples)
         self.sample_targets = deque(maxlen=self.max_samples)
 
     @property
     def sample_count(self) -> int:
+        """Number of trusted samples currently available for recalibration."""
+
         return len(self.sample_predictions)
 
     @property
     def is_active(self) -> bool:
+        """Whether a fitted correction is currently available."""
+
         return self.slope is not None and self.intercept is not None
 
     def transform(self, prediction: np.ndarray) -> np.ndarray:
+        """Apply the current linear correction if enough labels are available."""
+
         if not self.is_active:
             return np.asarray(prediction, dtype=np.float32)
         prediction_array = np.asarray(prediction, dtype=np.float32)
@@ -123,6 +469,8 @@ class OnlineRecalibrationManager:
         base_prediction: np.ndarray,
         target: np.ndarray,
     ) -> bool:
+        """Store one trusted label and refit the correction when scheduled."""
+
         self.sample_predictions.append(np.asarray(base_prediction, dtype=np.float32).copy())
         self.sample_targets.append(np.asarray(target, dtype=np.float32).copy())
         if self.sample_count < self.min_samples:
@@ -137,6 +485,8 @@ class OnlineRecalibrationManager:
         return True
 
     def _fit(self) -> None:
+        """Solve a ridge-regularized 1D linear correction per output dimension."""
+
         predictions = np.asarray(self.sample_predictions, dtype=np.float32)
         targets = np.asarray(self.sample_targets, dtype=np.float32)
         output_dim = predictions.shape[-1]
@@ -165,6 +515,8 @@ class ForecastProviderDecorator:
         self.wrapped = wrapped
 
     def forecast(self, index: int) -> ForecastResult:
+        """Delegate forecasting to the wrapped provider."""
+
         return self.wrapped.forecast(index)
 
 
@@ -189,6 +541,8 @@ class RecalibratingForecastDecorator(ForecastProviderDecorator):
         )
 
     def forecast(self, index: int) -> ForecastResult:
+        """Forecast with the current recalibration transform applied."""
+
         result = self.wrapped.forecast(index)
         base_prediction = np.asarray(
             result.metadata.get("base_prediction", result.value),
@@ -216,6 +570,8 @@ class RecalibratingForecastDecorator(ForecastProviderDecorator):
         base_prediction: np.ndarray,
         target: np.ndarray,
     ) -> bool:
+        """Update recalibration from a simulator observation when available."""
+
         return self.manager.observe(
             step_index=step_index,
             base_prediction=base_prediction,
@@ -224,42 +580,60 @@ class RecalibratingForecastDecorator(ForecastProviderDecorator):
 
     @property
     def update_count(self) -> int:
+        """Number of recalibration fits performed so far."""
+
         return self.manager.update_count
 
     @property
     def sample_count(self) -> int:
+        """Number of trusted labels collected by the recalibration manager."""
+
         return self.manager.sample_count
 
     @property
     def is_active(self) -> bool:
+        """Whether recalibration is currently affecting predictions."""
+
         return self.manager.is_active
 
 
 @dataclass(slots=True)
 class RollingErrorTracker:
+    """Track recent surrogate-vs-simulator errors for trust decisions."""
+
     window_size: int
     recent_errors: deque[float] = field(init=False, repr=False)
     last_observed_step: int = -1
 
     def __post_init__(self) -> None:
+        """Create a fixed-size rolling error buffer."""
+
         self.recent_errors = deque(maxlen=self.window_size)
 
     @property
     def has_history(self) -> bool:
+        """Whether at least one validation error has been observed."""
+
         return bool(self.recent_errors)
 
     @property
     def mean_error(self) -> float:
+        """Mean of the current rolling error window."""
+
         if not self.recent_errors:
             return float("nan")
         return float(np.mean(self.recent_errors))
 
     def observe(self, *, step_index: int, error: float) -> float:
+        """Record a new observed error and return the updated rolling mean."""
+
         self.recent_errors.append(float(error))
         self.last_observed_step = step_index
         return self.mean_error
 
     def steps_since_last_observation(self, step_index: int) -> int:
+        """Count steps since the last simulator-backed validation point."""
+
         if self.last_observed_step < 0:
             return step_index + 1
         return step_index - self.last_observed_step
@@ -285,6 +659,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
         self.reset()
 
     def reset(self) -> None:
+        """Reset switching state before evaluating a new threshold setting."""
+
         self.tracker = RollingErrorTracker(window_size=self.rolling_window)
         self.selected_path_previous: str | None = None
         self.controller_mode = "simulation"
@@ -293,6 +669,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
         self.switch_count = 0
 
     def forecast(self, index: int) -> ForecastResult:
+        """Select simulator or surrogate for one forecast index."""
+
         rolling_error_before = self.tracker.mean_error
         steps_since_last_observation = self.tracker.steps_since_last_observation(index)
         cooldown_before = self.cooldown_remaining
@@ -303,6 +681,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
         rolling_error_after = rolling_error_before
         reason = "simulation_hold"
 
+        # Warmup gives the controller a measured error history before any
+        # surrogate-only execution is allowed.
         if index < self.warmup_steps:
             surrogate_result = self.surrogate.forecast(index)
             simulation_result = self.simulator.forecast(index)
@@ -316,6 +696,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
                 current_mode="simulation",
             )
         elif self.controller_mode == "surrogate":
+            # Trusted surrogate mode is cheap most of the time, but periodic
+            # probes keep checking whether fallback is needed.
             if self.controller.should_probe(
                 current_mode=self.controller_mode,
                 steps_since_last_observation=steps_since_last_observation,
@@ -342,6 +724,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
                 selected_path = "surrogate"
                 reason = "trusted_surrogate"
         elif self.cooldown_remaining > 0:
+            # Cooldown prevents one good reentry check from immediately undoing
+            # a recent fallback decision.
             simulation_result = self.simulator.forecast(index)
             selected_path = "simulation"
             reason = "simulation_cooldown"
@@ -352,6 +736,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
             cooldown_remaining=self.cooldown_remaining,
             error_estimate=rolling_error_before,
         ):
+            # Reentry probes are the only path from simulator hold back into
+            # surrogate mode after warmup or fallback.
             surrogate_result = self.surrogate.forecast(index)
             simulation_result = self.simulator.forecast(index)
             probe_executed = True
@@ -369,6 +755,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
             selected_path = "simulation"
             reason = "simulation_hold"
 
+        # Trusted simulator labels from probe steps can recalibrate the wrapped
+        # surrogate without requiring labels on every test point.
         if surrogate_result is not None and simulation_result is not None:
             recalibration_updated = self._observe_trusted_label(
                 step_index=index,
@@ -463,6 +851,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
         surrogate_result: ForecastResult,
         simulation_result: ForecastResult,
     ) -> bool:
+        """Pass a simulator-backed label to a recalibrating surrogate wrapper."""
+
         observer = getattr(self.surrogate, "observe_trusted_label", None)
         if observer is None:
             return False
@@ -493,6 +883,8 @@ class SurrogateDecorator(ForecastProviderDecorator):
 
 @dataclass(slots=True)
 class DecoratorRunResult:
+    """Metrics and trace output for one decorator threshold setting."""
+
     model_name: str
     threshold: float
     threshold_multiplier: float
@@ -500,11 +892,15 @@ class DecoratorRunResult:
     trace: pd.DataFrame
 
     def to_record(self) -> dict[str, float | str]:
+        """Flatten the run result for CSV export."""
+
         return {"model_name": self.model_name, "threshold": self.threshold, **self.metrics}
 
 
 @dataclass(slots=True)
 class DecoratorEvaluationArtifacts:
+    """All decorator outputs saved by the experiment pipeline."""
+
     model_name: str
     sensitivity_frame: pd.DataFrame
     preferred_result: DecoratorRunResult
@@ -532,6 +928,8 @@ class DecoratorEvaluationRunner:
         model_name: str,
         threshold_multiplier: float,
     ) -> DecoratorRunResult:
+        """Evaluate the decorated provider across the whole test split."""
+
         self.provider.reset()
         rows: list[dict[str, float | int | str | bool]] = []
         effective_outputs: list[np.ndarray] = []
@@ -552,6 +950,8 @@ class DecoratorEvaluationRunner:
             pure_surrogate_value = self.surrogate.value_at(index)
             metadata = result.metadata
 
+            # Effective error measures the actually selected path; base error
+            # keeps the undecorated surrogate comparison available in the trace.
             effective_error = _mean_absolute_error(result.value, true_value)
             base_surrogate_error = _mean_absolute_error(pure_surrogate_value, true_value)
             executed_surrogate_prediction = metadata.get("surrogate_prediction")
@@ -571,6 +971,8 @@ class DecoratorEvaluationRunner:
             effective_step_errors.append(effective_error)
             effective_outputs.append(np.asarray(result.value, dtype=np.float32).copy())
 
+            # Usage counters quantify the speed-accuracy tradeoff created by
+            # the switching policy.
             if result.source == "surrogate":
                 surrogate_steps += 1
             else:
@@ -583,6 +985,8 @@ class DecoratorEvaluationRunner:
                 observed_steps += 1
                 observed_errors.append(observed_error)
 
+            # The trace is intentionally verbose because it supports thesis
+            # figures and debugging of individual switching decisions.
             rows.append(
                 {
                     "index": index,
@@ -624,6 +1028,8 @@ class DecoratorEvaluationRunner:
         surrogate_total_runtime_ms = float(np.sum(self.surrogate.runtime_ms))
         pure_surrogate_mae = mae(y_true, base_surrogate_array)
 
+        # Managed-surrogate metrics include only steps where the surrogate was
+        # actually executed, which can differ from the final decorated output.
         if executed_surrogate_outputs:
             managed_surrogate_array = np.asarray(executed_surrogate_outputs, dtype=np.float32)
             managed_surrogate_targets = np.asarray(executed_surrogate_targets, dtype=np.float32)
@@ -698,6 +1104,8 @@ def evaluate_decorator_thresholds(
     normalization: NormalizationStats,
     config: ExperimentConfig,
 ) -> DecoratorEvaluationArtifacts:
+    """Evaluate decorator behavior over the configured threshold multipliers."""
+
     y_calibration = _denormalize(calibration_split.y, normalization)
     calibration_predictions = _collect_surrogate_predictions(
         artifacts=artifacts,
@@ -713,6 +1121,8 @@ def evaluate_decorator_thresholds(
     )
 
     y_true = _denormalize(test_split.y, normalization)
+    # Streaming runtimes approximate the online use case, where one forecast is
+    # requested per control step instead of as a large offline batch.
     surrogate_predictions, surrogate_runtimes = _collect_streaming_surrogate_outputs(
         artifacts=artifacts,
         X=test_split.X,
@@ -735,6 +1145,8 @@ def evaluate_decorator_thresholds(
     results: list[DecoratorRunResult] = []
     for multiplier, threshold in thresholds:
         runtime_surrogate: ForecastProvider = surrogate_adapter
+        # Online recalibration is wrapped around the same surrogate interface, so
+        # the switching decorator does not need special-case prediction logic.
         if config.decorator.enable_online_recalibration:
             runtime_surrogate = RecalibratingForecastDecorator(
                 runtime_surrogate,
@@ -792,6 +1204,8 @@ def _collect_surrogate_predictions(
     device: str,
     batch_size: int,
 ) -> np.ndarray:
+    """Run model inference and convert predictions back to physical units."""
+
     predictions_norm = predict_model(
         artifacts=artifacts,
         X=X,
@@ -809,6 +1223,8 @@ def _collect_streaming_surrogate_outputs(
     batch_size: int,
     config: ExperimentConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Collect surrogate values and assign online per-step runtimes."""
+
     predictions = _collect_surrogate_predictions(
         artifacts=artifacts,
         X=X,
@@ -837,6 +1253,8 @@ def _measure_streaming_step_latency_ms(
     enable_jit_optimization: bool,
     max_samples: int = 96,
 ) -> float:
+    """Estimate single-step runtime for online decorator execution."""
+
     if len(X) == 0:
         return 0.0
 
@@ -877,6 +1295,8 @@ def _prepare_streaming_torch_model(
     example_input: torch.Tensor,
     enable_jit_optimization: bool,
 ) -> torch.nn.Module:
+    """Optionally trace the PyTorch model for faster repeated inference."""
+
     runtime_model = model
     if not enable_jit_optimization:
         return runtime_model
@@ -893,6 +1313,8 @@ def _prepare_streaming_torch_model(
 
 @contextmanager
 def _temporary_torch_num_threads(thread_count: int):
+    """Temporarily set PyTorch CPU threads while measuring streaming latency."""
+
     if thread_count <= 0:
         yield
         return
@@ -913,15 +1335,67 @@ def _build_threshold_schedule(
     base_error: float,
     multipliers: list[float],
 ) -> list[tuple[float, float]]:
+    """Scale the calibration error into concrete trust thresholds."""
+
     thresholds = []
     for multiplier in multipliers:
         thresholds.append((float(multiplier), float(base_error * multiplier)))
     return thresholds
 
 
+def _as_component_provider(
+    provider: ComponentStepProvider | ComponentStep,
+    *,
+    source: str,
+) -> ComponentStepProvider:
+    """Normalize plain component functions and provider objects to one API."""
+
+    if hasattr(provider, "step"):
+        return provider
+    return ComponentModelAdapter(model=provider, source=source)
+
+
+def _component_state_error(
+    left: ComponentState,
+    right: ComponentState,
+    keys: Sequence[str] | None,
+) -> float:
+    """Measure disagreement between surrogate and simulator component states."""
+
+    resolved_keys = list(keys) if keys is not None else _shared_numeric_state_keys(left, right)
+    if not resolved_keys:
+        raise ValueError("No numeric component state keys are available for error tracking.")
+
+    left_values = np.asarray([float(left[key]) for key in resolved_keys], dtype=np.float32)
+    right_values = np.asarray([float(right[key]) for key in resolved_keys], dtype=np.float32)
+    return _mean_absolute_error(left_values, right_values)
+
+
+def _shared_numeric_state_keys(left: ComponentState, right: ComponentState) -> list[str]:
+    """Return state keys that can be compared numerically on both sides."""
+
+    return sorted(
+        key
+        for key in left.keys() & right.keys()
+        if _is_numeric_scalar(left[key]) and _is_numeric_scalar(right[key])
+    )
+
+
+def _is_numeric_scalar(value: Any) -> bool:
+    """Check whether a state value is safe to include in scalar MAE."""
+
+    return isinstance(value, (int, float, np.number, bool)) and not isinstance(value, str)
+
+
 def _denormalize(values: np.ndarray, normalization: NormalizationStats) -> np.ndarray:
+    """Convert normalized targets or predictions back to physical scale."""
+
     return values * normalization.target_std + normalization.target_mean
 
 
 def _mean_absolute_error(left: np.ndarray, right: np.ndarray) -> float:
-    return float(np.mean(np.abs(np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32))))
+    """Compute scalar MAE for one vector-valued step."""
+
+    return float(
+        np.mean(np.abs(np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32)))
+    )

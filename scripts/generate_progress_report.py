@@ -1,3 +1,5 @@
+"""Generate a PDF summary of thesis implementation progress and results."""
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +27,8 @@ RUNS = {
 
 
 def load_metrics(run_dir: Path) -> pd.DataFrame:
+    """Load model metrics for one saved experiment run."""
+
     frame = pd.read_csv(run_dir / "metrics.csv")
     numeric_columns = [col for col in frame.columns if col != "model_name"]
     frame[numeric_columns] = frame[numeric_columns].apply(pd.to_numeric)
@@ -32,6 +36,8 @@ def load_metrics(run_dir: Path) -> pd.DataFrame:
 
 
 def load_decorator_summary(run_dir: Path) -> pd.DataFrame:
+    """Load decorator sensitivity results for a saved experiment run."""
+
     frame = pd.read_csv(run_dir / "decorator" / "decorator_summary.csv")
     numeric_columns = [
         col
@@ -48,6 +54,8 @@ def load_decorator_summary(run_dir: Path) -> pd.DataFrame:
 
 
 def wrap_lines(text: str, width: int = 98) -> list[str]:
+    """Wrap multi-paragraph text for simple Matplotlib PDF pages."""
+
     lines: list[str] = []
     for raw_line in text.splitlines():
         if not raw_line.strip():
@@ -58,6 +66,8 @@ def wrap_lines(text: str, width: int = 98) -> list[str]:
 
 
 def add_text_page(pdf: PdfPages, title: str, body: str) -> None:
+    """Add one text-only page to the PDF report."""
+
     fig = plt.figure(figsize=(8.27, 11.69))
     fig.patch.set_facecolor("white")
     plt.axis("off")
@@ -80,6 +90,8 @@ def add_table_page(
     *,
     height: float = 0.5,
 ) -> None:
+    """Add a landscape table page with explanatory notes."""
+
     fig = plt.figure(figsize=(11.69, 8.27))
     fig.patch.set_facecolor("white")
     plt.axis("off")
@@ -88,6 +100,8 @@ def add_table_page(
     display_frame = frame.copy()
     for column in display_frame.columns:
         if display_frame[column].dtype.kind in {"i", "f"}:
+            # Fixed decimal formatting keeps tables readable in the generated
+            # PDF without modifying the original numeric data frame.
             display_frame[column] = display_frame[column].map(lambda value: f"{value:.4f}")
 
     table = plt.table(
@@ -111,6 +125,8 @@ def add_table_page(
 
 
 def add_image_page(pdf: PdfPages, title: str, image_path: Path, caption: str) -> None:
+    """Add one saved plot image and caption to the report."""
+
     fig = plt.figure(figsize=(8.27, 11.69))
     fig.patch.set_facecolor("white")
     plt.axis("off")
@@ -128,6 +144,8 @@ def add_image_page(pdf: PdfPages, title: str, image_path: Path, caption: str) ->
 
 
 def build_implementation_text() -> str:
+    """Return the narrative overview of implemented thesis components."""
+
     return (
         "This report summarizes the full implementation progress completed so far for the thesis "
         "'Surrogate Modeling based on Machine Learning Approaches for Short-Term Load Forecasting in Microgrids.'\n\n"
@@ -148,6 +166,8 @@ def build_implementation_text() -> str:
 
 
 def build_improvements_text() -> str:
+    """Return the narrative summary of the main result improvements."""
+
     return (
         "Main improvements achieved so far:\n"
         "- Accuracy improvement over naive baselines: on the first end-to-end run, LSTM reduced MAE from 0.0795 "
@@ -170,6 +190,8 @@ def build_improvements_text() -> str:
 
 
 def build_conclusion_text() -> str:
+    """Return the closing status and recommended next-step text."""
+
     return (
         "Current thesis status:\n"
         "- The surrogate-modeling pipeline is implemented end to end.\n"
@@ -187,6 +209,8 @@ def build_conclusion_text() -> str:
 
 
 def build_key_results_table() -> pd.DataFrame:
+    """Create the compact hand-curated comparison table for major runs."""
+
     summary_rows = [
         {
             "run": "Baseline v1",
@@ -233,6 +257,8 @@ def build_key_results_table() -> pd.DataFrame:
 
 
 def main() -> None:
+    """Build the PDF report from saved metrics, tables, and plots."""
+
     parser = argparse.ArgumentParser(description="Generate a PDF report summarizing thesis progress.")
     parser.add_argument(
         "--output",
@@ -260,6 +286,8 @@ def main() -> None:
         ]
     ]
 
+    # Each page is intentionally self-contained so it can be reused directly in
+    # thesis discussion or supervisor meetings.
     with PdfPages(output_path) as pdf:
         add_text_page(
             pdf,

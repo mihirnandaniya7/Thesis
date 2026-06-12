@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from surrogate_thesis.config import SimulatorConfig
-from surrogate_thesis.simulation import ReferenceSimulator
+from surrogate_thesis.simulation import ReferenceSimulator, battery_component_step
 
 
 class ReferenceSimulatorTests(unittest.TestCase):
@@ -39,6 +39,36 @@ class ReferenceSimulatorTests(unittest.TestCase):
             {"pv_kw", "battery_power_kw", "battery_soc_kwh", "net_load_kw"}.issubset(frame.columns)
         )
         self.assertTrue(frame["battery_soc_kwh"].between(0.0, config.battery_capacity_kwh).all())
+
+    def test_battery_component_step_matches_reference_method(self) -> None:
+        config = SimulatorConfig(include_stage2_microgrid=True)
+        simulator = ReferenceSimulator()
+        simulator.reset(config, seed=23)
+        simulator.state.battery_soc_kwh = 2.5
+
+        state = simulator.component_state()
+        parameters = simulator.component_parameters()
+        action = {"load_kw": 2.2, "pv_kw": 0.4}
+        component_state = battery_component_step(
+            state=state,
+            parameters=parameters,
+            action=action,
+            delta_t=0.25,
+        )
+
+        simulator.state.battery_soc_kwh = 2.5
+        battery_kw, net_load_kw = simulator._apply_battery(
+            load_kw=action["load_kw"],
+            pv_kw=action["pv_kw"],
+            dt_hours=0.25,
+        )
+
+        self.assertAlmostEqual(component_state["battery_power_kw"], battery_kw)
+        self.assertAlmostEqual(component_state["net_load_kw"], net_load_kw)
+        self.assertAlmostEqual(
+            component_state["battery_soc_kwh"],
+            simulator.state.battery_soc_kwh,
+        )
 
 
 if __name__ == "__main__":

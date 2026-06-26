@@ -1,0 +1,69 @@
+{
+  "run_name": "stage2_transformer_tuning_v1",
+  "seed": 42,
+  "model_names": [
+    "persistence",
+    "linear_regression",
+    "lstm",
+    "transformer"
+  ],
+  "simulator": {
+    "start": "2025-01-01",
+    "days": 120,
+    "time_resolution_minutes": 15,
+    "internal_substeps": 48,
+    "base_load_kw": 1.8,
+    "daily_amplitude_kw": 0.9,
+    "morning_peak_kw": 0.45,
+    "evening_peak_kw": 0.85,
+    "weekday_multiplier": 1.08,
+    "weekend_multiplier": 0.93,
+    "seasonal_amplitude": 0.12,
+    "noise_std_kw": 0.08,
+    "ar_coefficient": 0.72,
+    "peak_event_probability": 0.05,
+    "peak_event_scale_kw": 0.7,
+    "include_stage2_microgrid": true,
+    "pv_peak_kw": 3.2,
+    "battery_capacity_kwh": 7.5,
+    "battery_power_kw": 2.4
+  },
+  "dataset": {
+    "lookback": 48,
+    "horizon": 1,
+    "feature_columns": [
+      "load_kw",
+      "pv_kw",
+      "battery_soc_kwh",
+      "net_load_kw",
+      "hour_sin",
+      "hour_cos",
+      "is_weekend"
+    ],
+    "target_column": "net_load_kw",
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15
+  },
+  "model": {
+    "lstm_hidden_size": 64,
+    "lstm_num_layers": 2,
+    "transformer_d_model": 64,
+    "transformer_nhead": 4,
+    "transformer_num_layers": 3,
+    "transformer_dim_feedforward": 128,
+    "dropout": 0.1
+  },
+  "training": {
+    "device": "cpu",
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "max_epochs": 30,
+    "patience": 6
+  },
+  "evaluation": {
+    "latency_samples": 256,
+    "prediction_plot_points": 288
+  }
+}
